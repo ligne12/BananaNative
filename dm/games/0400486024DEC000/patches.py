@@ -44,6 +44,11 @@ OBS = {
     (0x773a00, 27 | 14 << 8, 'd503237f', 'trace 14: a pane makes its root layout holder (x0 the pane, x1 its heap, lr the caller)'),
     (0x74d7b0, 27 | 15 << 8, 'd503237f', 'trace 15: a flow node is entered (x0 the node, lr the caller)'),
     (0xc66478, 27 | 16 << 8, 'f868d920', 'trace 16: an open-by-name request resolved its pane (x0 the id found, x19 the request)'),
+    # The title emits no glyph draw: where a text box's calculation stops (main+0x150b670 each frame; main+0xe4e0e0 builds its glyphs from its font at +0xe8)
+    (0x150b670, 27 | 17 << 8, 'd503237f', 'trace 17: a text box is calculated (x0 the text box, lr the caller)'),
+    (0xe4e100, 27 | 18 << 8, 'f9407409', 'trace 18: a text box builds its glyphs (x0 the text box; lr main+0x150b74c on the frame, main+0xe4e0a0 on the texture thread)'),
+    (0xe4e22c, 27 | 19 << 8, 'b9400109', 'trace 19: a text box has no font (+0xe8 null): no glyphs (x8 its state word)'),
+    (0xe4e110, 27 | 20 << 8, 'aa0203f4', 'trace 20: a text box has its font and goes on (x0 the text box)'),
   ],
 }
 

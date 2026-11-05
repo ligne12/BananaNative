@@ -62,6 +62,8 @@ Every module is ZBIC-compressed (NSO flag bit 7): reading them takes the `zbic` 
   - The text box under the logo is pixel shader `b998f78a92860333`. Its four RGTC1 textures are only the band's decoration (`DM_VK_TEXDUMP`).
   - No draw of the title screen holds glyphs, and the host skips none: the game emits no text.
   - The scalable fonts (`Font2/Scalable/*.bfotf`) and the English messages (`Mals/USen.Product.110.sarc`) load (`DM_FS`). `tex_flush_upload` and `tex_dirty_upload` change nothing.
-  - The texture text thread (`eui::FontMgr` + 0x118) only serves explicitly registered boxes (the button guide's icons), which the title does not open. The observation gates in [`patches.py`](patches.py) are temporary. Where the text box drawing stops is being traced. Where the byte at `main+0x4e95f61` is set (a setting, or a debug switch) is not looked at.
+  - The texture text thread (`eui::FontMgr` + 0x118) only serves explicitly registered boxes (the button guide's icons), which the title does not open.
+  - The title's text boxes are calculated each frame (`main+0x150b670`), build their glyphs on the frame (`main+0xe4e0e0`) and have their font (`+0xe8` set): what stops is further on. Either the font's glyph texture pages (its vtable slots `+0xe0`, `+0xa8`, `+0xc8`) or the text box's draw.
+  - The observation gates in [`patches.py`](patches.py) are temporary. Where the byte at `main+0x4e95f61` is set (a setting, or a debug switch) is not looked at.
 - The memory layout is not measured (see above).
 - The translator changes move the chain version for every game: they need `scripts/regress.py check` on a Mac before they can go upstream.

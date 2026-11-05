@@ -101,7 +101,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 | [Taiko Risshiden V DX](#taiko-risshiden-v-dx) | 1 | 0 | 0 | 2 | 0 | `game` |
 | [The Legend of Zelda: Breath of the Wild](#the-legend-of-zelda-breath-of-the-wild) | 7 | 0 | 5 | 0 | 0 | `build` → `game` ×2 |
 | [The Legend of Zelda: Link's Awakening](#the-legend-of-zelda-links-awakening) | 1 | 0 | 0 | 0 | 0 | `build` → `game` |
-| [The Legend of Zelda: Ocarina of Time](#the-legend-of-zelda-ocarina-of-time) | 5 | 16 | 0 | 0 | 0 | `build` → `engine` ×2 |
+| [The Legend of Zelda: Ocarina of Time](#the-legend-of-zelda-ocarina-of-time) | 5 | 20 | 0 | 0 | 0 | `build` → `engine` ×2 |
 | [The Legend of Zelda: Tears of the Kingdom](#the-legend-of-zelda-tears-of-the-kingdom) | 0 | 0 | 9 | 0 | 0 | `build` → `game` |
 | [Xenoblade Chronicles 3](#xenoblade-chronicles-3) | 6 | 0 | 0 | 0 | 0 | `build` → `game` |
 
@@ -574,6 +574,10 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
   - gate 3611 at `+0x773a00`: trace 14: a pane makes its root layout holder (x0 the pane, x1 its heap, lr the caller)
   - gate 3867 at `+0x74d7b0`: trace 15: a flow node is entered (x0 the node, lr the caller)
   - gate 4123 at `+0xc66478`: trace 16: an open-by-name request resolved its pane (x0 the id found, x19 the request)
+  - gate 4379 at `+0x150b670`: trace 17: a text box is calculated (x0 the text box, lr the caller)
+  - gate 4635 at `+0xe4e100`: trace 18: a text box builds its glyphs (x0 the text box; lr main+0x150b74c on the frame, main+0xe4e0a0 on the texture thread)
+  - gate 4891 at `+0xe4e22c`: trace 19: a text box has no font (+0xe8 null): no glyphs (x8 its state word)
+  - gate 5147 at `+0xe4e110`: trace 20: a text box has its font and goes on (x0 the text box)
 
 ### The Legend of Zelda: Tears of the Kingdom
 
