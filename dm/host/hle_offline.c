@@ -13,6 +13,14 @@ HLE_FORCE("_ZN2nn5prepo10InitializeEv", "telemetry init: the original connects t
 HLE_FORCE("_ZN2nn5prepo12AddSessionIdEPNS0_10PlayReportEPKc", "telemetry session ID: no service connection, nothing added, reports success", Result, h_prepo_AddSess, void *rep, const char *key) { (void)rep; (void)key; return RES_OK; }
 HLE_FORCE("_ZN2nn5prepo27AddInternetConnectionStatusEPNS0_10PlayReportEPKcS4_S4_", "telemetry internet connection status: no service connection, nothing added, reports success", Result, h_prepo_AddNet, void *rep, const char *a, const char *b, const char *c) { (void)rep; (void)a; (void)b; (void)c; return RES_OK; }
 HLE_FORCE("_ZN2nn5prepo28RequestImmediateTransmissionEv", "telemetry immediate upload; nothing is sent, reports success", Result, h_prepo_Tx, void) { return RES_OK; }
+// Send a report (SDK 22; The Legend of Zelda: Ocarina of Time, main+0x379164c, when its intro movie ends): returns an AsyncContext {IAsyncContext *, Result} through x8, which C cannot name
+//   (a 16-byte struct comes back in x0 / x1). Unhooked, the SDK connects to prepo:u and aborts (0xe15). The stub writes an empty context {NULL, success}: the SDK's own GetCompletionEvent
+//   creates and signals an event for it, GetResult returns the stored Result and the destructor releases nothing (sdk+0x5a9298, +0x5a9354, +0x5a91c8)
+extern const char h_prepo_SendU[];
+__asm__(".text\n.p2align 2\n.globl " PLAT_ASM_SYM(h_prepo_SendU) "\n" PLAT_ASM_HIDDEN " " PLAT_ASM_SYM(h_prepo_SendU) "\n" PLAT_ASM_SYM(h_prepo_SendU) ":\n"
+        "    stp xzr, xzr, [x8]\n    ret\n");
+PLAT_TABLE(swforce) static const hle_force_ent hle_force_h_prepo_SendU = {"_ZN2nn5prepo10PlayReport4SendERKNS_7account3UidE", (void *)(uintptr_t)h_prepo_SendU,
+    "telemetry report send (user); nothing is sent, the AsyncContext it returns through x8 is an empty one, done with success"};
 
 // ---------- ldn: local wireless. Initialization fails, state is always "none" ----------
 HLE_FORCE("_ZN2nn3ldn10InitializeEv", "local wireless (cut): initialization fails", Result, h_ldn_Init, void) { return RES_FAIL; }

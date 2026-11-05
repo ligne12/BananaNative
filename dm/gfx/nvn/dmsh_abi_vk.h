@@ -77,7 +77,7 @@
 #define DMSH_VK_KIND_SAMP_C2A 17         // samp_c2a: the same for samplers; soff = the c2 byte offset of one sampler word ORed into every element, 0xFFFF none
 #define DMSH_VK_KIND_TEX_POOL 18         // tex_pool: set 1 binding 0
 #define DMSH_VK_KIND_SAMP_POOL 19        // samp_pool: set 1 binding 1
-#define DMSH_VK_KIND_GMEM_MAP 20         // gmem_map: the pool table for raw global memory (DMSH_GMEM_MAP_*; delta = buffer device address - guest address), STORAGE_BUFFER
+#define DMSH_VK_KIND_GMEM_MAP 20         // gmem_map: the page table for raw global memory (DMSH_GMEM_PT_*; delta = buffer device address - guest address), STORAGE_BUFFER
 #define DMSH_VK_KIND_GMEM_LOG 21         // gmem_log: the write log of those stores, STORAGE_BUFFER, cleared per draw or dispatch
 #define DMSH_VK_KIND_SHARED_SPILL 22     // shared_spill: a compute program's shared memory past DMSH_VK_SHARED_MAX, STORAGE_BUFFER, the record's bytes per workgroup slice. Workgroup w
                                          // (linear index (z * groups y + y) * groups x + x) uses slice w mod (the bound range / bytes); slices not cleared (shared memory starts undefined)

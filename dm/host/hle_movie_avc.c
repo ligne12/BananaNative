@@ -21,6 +21,7 @@ struct mavc {
 };
 
 mavc *mavc_new(void) { mavc *a = calloc(1, sizeof *a); if (!a) die("movie: AVC decoder allocation failed"); return a; }
+mavc *mavc_new_av1(int w, int h) { (void)w; (void)h; return NULL; }   // no AV1 through VideoToolbox here (only recent Apple chips decode it)
 static void close_session(mavc *a) {
     if (a->vs) { VTDecompressionSessionWaitForAsynchronousFrames(a->vs); VTDecompressionSessionInvalidate(a->vs); CFRelease(a->vs); a->vs = NULL; }
     if (a->fd) { CFRelease(a->fd); a->fd = NULL; }

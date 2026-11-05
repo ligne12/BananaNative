@@ -926,6 +926,44 @@ void vka_pso_async_line(char *out, size_t n) {
              (unsigned long long)atomic_load(&g_as_queued), (unsigned long long)atomic_load(&g_as_made), atomic_load(&g_as_ns) / 1e6, atomic_load(&g_as_lat_max_ns) / 1e6,
              atomic_load(&g_as_depth_max), (unsigned long long)atomic_load(&g_as_skips));
 }
+// DM_VK_PSTATS=<key>,… (Android, restart; at most 8 keys; the device needs VK_KHR_pipeline_executable_properties): the first pipeline made with one of those shaders is made
+// once more, whole, with no pipeline cache and with the driver's statistics captured; each stage's statistics are logged (Turnip: instructions, registers, waves, spills), then
+// that copy goes. What a translated shader costs once the driver compiled it, to weigh changes of the translator's output (a stall of one compile per key)
+static void pstats(vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, const vka_gkey *k) {
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; static uint64_t key[8]; static int nk = -1, done[8];
+    pthread_mutex_lock(&mu);
+    if (nk < 0) { nk = 0; for (const char *e = getenv("DM_VK_PSTATS"); e && *e && nk < 8;) { char *x; uint64_t v = strtoull(e, &x, 16); if (x == e) break; key[nk++] = v; e = *x == ',' ? x + 1 : x; } }
+    int hit = -1; for (int i = 0; i < nk && hit < 0; i++) for (int st = 0; st < VKA_NSTAGE; st++) if (sh[st] && sh[st]->key == key[i] && !done[i]) { hit = i; break; }
+    if (hit >= 0) done[hit] = 1;
+    pthread_mutex_unlock(&mu);
+    if (hit < 0) return;
+    PFN_vkGetPipelineExecutablePropertiesKHR gp = (PFN_vkGetPipelineExecutablePropertiesKHR)vk.vkGetDeviceProcAddr(V.dev, "vkGetPipelineExecutablePropertiesKHR");
+    PFN_vkGetPipelineExecutableStatisticsKHR gs = (PFN_vkGetPipelineExecutableStatisticsKHR)vk.vkGetDeviceProcAddr(V.dev, "vkGetPipelineExecutableStatisticsKHR");
+    pstate *P = malloc(sizeof *P); VkPipeline p = VK_NULL_HANDLE; VkResult r = VK_ERROR_UNKNOWN;
+    if (gp && gs && P && pstate_fill(P, sh, lay, k)) { P->ci.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR; r = vk.vkCreateGraphicsPipelines(V.dev, VK_NULL_HANDLE, 1, &P->ci, NULL, &p); }
+    free(P);
+    if (r || !p) { VRED("pipeline statistics of %016llx: the copy of its pipeline was not made (%d)", (unsigned long long)key[hit], r); return; }
+    VkPipelineInfoKHR pi = {VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR, .pipeline = p};
+    VkPipelineExecutablePropertiesKHR ep[8]; uint32_t ne = 8;
+    for (uint32_t i = 0; i < ne; i++) ep[i] = (VkPipelineExecutablePropertiesKHR){VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR};
+    VkResult rp = gp(V.dev, &pi, &ne, ep); if (rp < 0) ne = 0;
+    VLOG("pipeline statistics of %016llx: its pipeline copied (%d executables, %d)", (unsigned long long)key[hit], (int)ne, rp);
+    for (uint32_t e = 0; e < ne; e++) {
+        VkPipelineExecutableStatisticKHR st[48]; uint32_t ns = 48;
+        for (uint32_t i = 0; i < ns; i++) st[i] = (VkPipelineExecutableStatisticKHR){VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR};
+        VkPipelineExecutableInfoKHR ei = {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR, .pipeline = p, .executableIndex = e};
+        if (gs(V.dev, &ei, &ns, st) < 0) ns = 0;
+        char line[1500]; size_t o = 0; line[0] = 0;
+        for (uint32_t i = 0; i < ns && o < sizeof line; i++) {
+            const VkPipelineExecutableStatisticValueKHR *v = &st[i].value;
+            if (st[i].format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR) o += (size_t)snprintf(line + o, sizeof line - o, " %s %.2f;", st[i].name, v->f64);
+            else o += (size_t)snprintf(line + o, sizeof line - o, " %s %lld;", st[i].name, st[i].format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR ? (long long)v->b32 :
+                                       st[i].format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR ? (long long)v->i64 : (long long)v->u64);
+        }
+        VLOG("pipeline statistics of %016llx: %s:%s", (unsigned long long)key[hit], ep[e].name, line);
+    }
+    vk.vkDestroyPipeline(V.dev, p, NULL);
+}
 static gval *gfx_obtain(const gkey_full *fk, uint64_t h, size_t len, vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, const vka_gkey *k, int prewarm, int *made) {
     *made = 0;
     int async = !prewarm && !sh[7] && as_threads() > 0;
@@ -940,6 +978,8 @@ static gval *gfx_obtain(const gkey_full *fk, uint64_t h, size_t len, vka_shader 
     g = calloc(1, sizeof *g); g->busy = 1; g->pw = (uint8_t)(prewarm != 0); g->tid = prewarm ? gettid() : 0; km_put(&g_gfx, fk, h, g);
     pthread_mutex_unlock(&g_mu);
     uint64_t t_make = now_ns();
+    if (V.pstats && !sh[7]) pstats(sh, lay, k);
+    { static int once; if (!once) { once = 1; const char *e = getenv("DM_VK_PSTATS"); if (e && *e) VLOG("pipeline statistics of %s: %s", e, V.pstats ? "on" : "[RED] the device has no pipeline executable statistics"); } }
     if (async) {
         pc_open();
         VkPipeline p = VK_NULL_HANDLE;
@@ -1063,7 +1103,13 @@ static VkPipeline cs_obtain(vka_shader *cs, const vka_layout *lay, int prewarm, 
     // limit (a library built before the spill, or a device under DMSH_VK_SHARED_MAX) is not made and its dispatches are skipped. docs/reference/shaders.md "Compute
     // programs over the device's shared memory". DM_VK_CS_SHARED_OVER=1 makes them anyway (an A/B: what the driver does with them)
     uint32_t smax = V.props.limits.maxComputeSharedMemorySize;
-    if (smax && cs->e->shared > smax && !VKA_ENV("DM_VK_CS_SHARED_OVER", 0)) {
+    // DM_VK_CS_SKIP=<key>,... (diagnostic): those programs are not made either, their dispatches skipped (a program the driver's compiler runs out of memory on:
+    // Turnip on The Legend of Zelda: Ocarina of Time's d15370a382630d4e, 5.5 MB of SPIR-V)
+    const char *skip = getenv("DM_VK_CS_SKIP"); char kx[17]; snprintf(kx, sizeof kx, "%016llx", (unsigned long long)cs->key);
+    if (skip && strstr(skip, kx)) {
+        r = VK_ERROR_FEATURE_NOT_PRESENT; over = 1;
+        static _Atomic int n; if (atomic_fetch_add(&n, 1) < 16) VRED("compute program %016llx: not made (DM_VK_CS_SKIP), its dispatches are skipped", (unsigned long long)cs->key);
+    } else if (smax && cs->e->shared > smax && !VKA_ENV("DM_VK_CS_SHARED_OVER", 0)) {
         r = VK_ERROR_FEATURE_NOT_PRESENT; over = 1;
         static _Atomic int n; if (atomic_fetch_add(&n, 1) < 16) VRED("compute program %016llx takes %u bytes of shared memory, the device at most %u: not made, its dispatches are skipped (the first 16 are logged; the count is in the pipeline line)", (unsigned long long)cs->key, cs->e->shared, smax);
     } else { int bs = build_begin("compute pipeline", cs->key, 0); r = vk.vkCreateComputePipelines(V.dev, g_pc, 1, &ci, NULL, &p); build_end(bs); }

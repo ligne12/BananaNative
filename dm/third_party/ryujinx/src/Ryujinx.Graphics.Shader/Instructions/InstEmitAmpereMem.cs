@@ -29,6 +29,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             x(0x98e, InstName.Red, ARed, N, writesRd: false);
             x(0x9a8, InstName.Atom, AAtomg, N);
             x(0x3a8, InstName.Atom, AAtomg, N);
+            x(0x3a9, InstName.Atom, AAtomgCas, N);
             x(AmpereOpcodes.Ldl, InstName.Ldl, ALdLocalShared, N);
             x(0x984, InstName.Lds, ALdLocalShared, N);
             x(0x387, InstName.Stl, AStLocalShared, N, writesRd: false);
@@ -315,6 +316,25 @@ namespace Ryujinx.Graphics.Shader.Instructions
             Operand res = EmitAtomicOp(context, StorageKind.GlobalMemory, (AtomOp)x.Bits(87, 91), (AtomSize)x.Bits(73, 76), lo, hi, Register(x.Rb, RegisterType.Gpr));
 
             ASet(context, x, res);
+        }
+
+        // ATOMG.CAS Rd, [Ra + offset], Rb (expected), Rc (new value) (0x3a9): Ra 24..32 with its pair bit at 72, the offset 40..64, Rc 64..72, the size 73..76; no uniform form
+        // (Mesa NAK sm70_encode.rs, OpAtom with AtomOp::CmpExch on global memory). Rd is the old value. Only the 32-bit form occurs (The Legend of Zelda: Ocarina of Time, 7 shaders)
+        public static void AAtomgCas(EmitterContext context)
+        {
+            AmpereOp x = new(context.CurrOp);
+            int size = x.Bits(73, 76);
+
+            if (size > 1)
+            {
+                throw AFail(context, $"ATOMG.CAS size {size}");
+            }
+
+            (Operand lo, Operand hi) = AGlobalAddress(context, x, 72, 64, 0);
+            Operand expected = x.Rb >= RegisterConsts.RegisterZeroIndex ? Const(0) : Register(x.Rb, RegisterType.Gpr);
+            Operand value = x.Rc >= RegisterConsts.RegisterZeroIndex ? Const(0) : Register(x.Rc, RegisterType.Gpr);
+
+            ASet(context, x, context.AtomicCompareAndSwap(StorageKind.GlobalMemory, lo, hi, expected, value));
         }
 
         // MEMBAR: the order of this thread's memory operations

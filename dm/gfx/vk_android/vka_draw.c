@@ -476,10 +476,9 @@ static int ssbo_desc(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *bi) {
 // its commit), so the memo is forgotten at each submission's start (vka_draw_sub_begin)
 typedef struct { VkBuffer buf; VkDeviceSize off; } c0_at;
 static struct { int valid; vka_span s; uint8_t b[DMSH_DRV_SIZE]; } g_dm[VKA_NSTAGE][3];
-static struct { int valid; uint64_t gen; vka_span s; } g_gm;
 static struct { int valid; uint32_t ref; vka_span s; } g_sm_ref;   // the support buffer with the alpha test's reference (stage_writes)
 static int g_drv_memo = 1; static uint64_t g_dm_hit, g_dm_miss;
-static void drv_memo_reset(void) { for (int st = 0; st < VKA_NSTAGE; st++) for (int b = 0; b < 3; b++) g_dm[st][b].valid = 0; g_gm.valid = 0; g_sm_ref.valid = 0; g_drv_memo = VKA_ENV("DM_VK_DRV_MEMO", 1); }
+static void drv_memo_reset(void) { for (int st = 0; st < VKA_NSTAGE; st++) for (int b = 0; b < 3; b++) g_dm[st][b].valid = 0; g_sm_ref.valid = 0; g_drv_memo = VKA_ENV("DM_VK_DRV_MEMO", 1); }
 static int drv_seg(const vka_dstate *d, int st, int bank, int pool, VkDescriptorBufferInfo *bi, c0_at *c0) {
     size_t sz = vka_drv_size(bank); vka_span s;
     // One memo slot per segment kind: c0, c2 and the push bank. Any other driver bank (an all-zero c17-style read of DMSH_DRV_SIZE bytes) takes the fill below: sharing
@@ -501,20 +500,64 @@ static int drv_seg(const vka_dstate *d, int st, int bank, int pool, VkDescriptor
     if (bank == 0 && c0) { c0->buf = s.buf; c0->off = s.off; }
     return 1;
 }
-// Raw global memory's table (dmsh_abi.h DMSH_GMEM_MAP_*): entry 0 empty, then the placed chunks by address with delta = device address - guest address, unused entries at ~0
-// (kept while no segment comes or goes: vka_mem_gen, and DM_VK_DRV_MEMO)
+// Raw global memory's page table (dmsh_abi.h DMSH_GMEM_PT_*; the shader side is GlobalToStorage.TryGenerateRawStorageOp with QueryGmemPageTable): one buffer for the process,
+// whose pages are set or cleared as placed segments come and go (vka_mem_gen), never rebuilt whole: draws in flight keep reading it, and a page changes only when its segment
+// came or went. A level 2 array is taken when its 2 MiB block first gets a segment, and stays. A segment below 2 MiB, past 39 bits or with an odd delta is left out ([RED]:
+// its accesses read 0). It replaces a table of 4,096 segments the shader searched (12 steps): Zelda: Ocarina of Time places 3,671, and the search inlined into each of a
+// vertex shader's 253 accesses made it 50,769 instructions long on Turnip
+enum { PT_MAXSEG = 65536, PT_MAXBLK = 3840 };   // level 2 arrays for 7.5 GiB of 2 MiB blocks: a 16 MiB buffer
+static struct { VkBuffer buf; VkDeviceMemory mem; uint32_t *w; VkDeviceSize size; uint32_t nblk; int ok, n; uint64_t gen; } g_gpt;
+static uint64_t g_gpt_lo[PT_MAXSEG], g_gpt_hi[PT_MAXSEG], g_gpt_bda[PT_MAXSEG];   // the segments the table holds, by address
+static int pt_init(void) {
+    if (g_gpt.ok) return g_gpt.ok > 0;
+    g_gpt.ok = -1;
+    g_gpt.size = ((VkDeviceSize)DMSH_GMEM_PT_L1 + DMSH_GMEM_PT_L1_WORDS + (VkDeviceSize)PT_MAXBLK * DMSH_GMEM_PT_BLOCK_WORDS) * 4;
+    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = g_gpt.size, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT};
+    if (vk.vkCreateBuffer(V.dev, &bci, NULL, &g_gpt.buf)) { VRED("raw global memory: the page table's buffer was not made"); return 0; }
+    VkMemoryRequirements mr; vk.vkGetBufferMemoryRequirements(V.dev, g_gpt.buf, &mr);
+    uint32_t t = vka_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = t}; void *p = NULL;
+    if (t == UINT32_MAX || vk.vkAllocateMemory(V.dev, &ai, NULL, &g_gpt.mem) || vk.vkBindBufferMemory(V.dev, g_gpt.buf, g_gpt.mem, 0) || vk.vkMapMemory(V.dev, g_gpt.mem, 0, VK_WHOLE_SIZE, 0, &p)) {
+        VRED("raw global memory: the page table's %llu bytes were not allocated", (unsigned long long)g_gpt.size); return 0; }
+    g_gpt.w = p; memset(p, 0, (size_t)g_gpt.size); vka_mem_grew(g_gpt.size); g_gpt.ok = 1;
+    return 1;
+}
+static void pt_set(uint64_t lo, uint64_t hi, uint64_t delta, int on) {
+    if (lo < (2u << 20) || hi > (1ull << 39) || (delta & 1)) {
+        static _Atomic int n; if (on && atomic_fetch_add(&n, 1) < 4) VRED("raw global memory: segment %#llx-%#llx (delta %#llx) left out of the page table", (unsigned long long)lo, (unsigned long long)hi, (unsigned long long)delta);
+        return;
+    }
+    for (uint64_t pg = lo >> 12; pg < (hi + 0xfff) >> 12; pg++) {
+        uint32_t *l1 = g_gpt.w + DMSH_GMEM_PT_L1 + (pg >> 9);
+        if (!*l1) {
+            if (!on) { pg |= 511; continue; }   // a block with no array has nothing to clear
+            if (g_gpt.nblk == PT_MAXBLK) { VRED_ONCE("raw global memory: the page table's %d level 2 arrays are all taken: later segments are left out (their accesses read 0)", PT_MAXBLK); return; }
+            *l1 = DMSH_GMEM_PT_L1 + DMSH_GMEM_PT_L1_WORDS + g_gpt.nblk++ * DMSH_GMEM_PT_BLOCK_WORDS;   // (its array is zeros)
+        }
+        uint32_t *e = g_gpt.w + *l1 + (pg & 511) * 2;
+        if (on) { e[1] = (uint32_t)(delta >> 32); __atomic_store_n(&e[0], (uint32_t)delta | 1, __ATOMIC_RELEASE); }   // (the valid bit last)
+        else { __atomic_store_n(&e[0], 0, __ATOMIC_RELEASE); e[1] = 0; }
+    }
+}
 uint64_t vka_mem_gen(void);
 static int gmem_map(VkDescriptorBufferInfo *bi) {
-    size_t n = (size_t)DMSH_GMEM_MAP_ENTRIES * DMSH_GMEM_MAP_ENTRY;
+    if (!pt_init()) return 0;
     uint64_t gen = vka_mem_gen();
-    if (g_drv_memo && g_gm.valid && g_gm.gen == gen) { *bi = (VkDescriptorBufferInfo){g_gm.s.buf, g_gm.s.off, n}; return 1; }
-    vka_span s; if (!vka_scratch(n, V.sb_align, &s)) return 0;
-    memset(s.ptr, 0xff, n); memset(s.ptr, 0, DMSH_GMEM_MAP_ENTRY);
-    static uint64_t lo[DMSH_GMEM_MAP_ENTRIES], hi[DMSH_GMEM_MAP_ENTRIES], bda[DMSH_GMEM_MAP_ENTRIES];
-    int k = vka_mem_chunks(lo, hi, bda, DMSH_GMEM_MAP_ENTRIES - 1);
-    for (int i = 0; i < k && i + 1 < DMSH_GMEM_MAP_ENTRIES; i++) { uint64_t e[4] = {lo[i], hi[i], bda[i] - lo[i], 0}; memcpy(s.ptr + (size_t)(i + 1) * DMSH_GMEM_MAP_ENTRY, e, sizeof e); }
-    g_gm.valid = 1; g_gm.gen = gen; g_gm.s = s;   // (a segment that came between the read of gen and the table: the next draw sees a new gen and builds it again)
-    *bi = (VkDescriptorBufferInfo){s.buf, s.off, n}; return 1;
+    if (gen != g_gpt.gen) {   // (a segment that comes between the read of gen and the list: the next draw sees a new gen and updates again)
+        static uint64_t lo[PT_MAXSEG], hi[PT_MAXSEG], bda[PT_MAXSEG]; static int add[PT_MAXSEG];
+        int k = vka_mem_chunks(lo, hi, bda, PT_MAXSEG), i = 0, j = 0, nadd = 0;
+        // Both lists are by address: the segments gone are cleared first, then the new ones set (a new one may take pages of one gone)
+        while (i < g_gpt.n || j < k) {
+            if (i < g_gpt.n && j < k && g_gpt_lo[i] == lo[j] && g_gpt_hi[i] == hi[j] && g_gpt_bda[i] == bda[j]) { i++; j++; }
+            else if (j == k || (i < g_gpt.n && g_gpt_lo[i] <= lo[j])) { pt_set(g_gpt_lo[i], g_gpt_hi[i], g_gpt_bda[i] - g_gpt_lo[i], 0); i++; }
+            else add[nadd++] = j++;
+        }
+        for (int a = 0; a < nadd; a++) pt_set(lo[add[a]], hi[add[a]], bda[add[a]] - lo[add[a]], 1);
+        memcpy(g_gpt_lo, lo, (size_t)k * sizeof *lo); memcpy(g_gpt_hi, hi, (size_t)k * sizeof *hi); memcpy(g_gpt_bda, bda, (size_t)k * sizeof *bda);
+        static uint32_t logged; if (!g_gpt.n || g_gpt.nblk >= logged + 256) { logged = g_gpt.nblk; VLOG("raw global memory: page table of %d segments, %u level 2 arrays of %d", k, g_gpt.nblk, PT_MAXBLK); }
+        g_gpt.n = k; g_gpt.gen = gen;
+    }
+    *bi = (VkDescriptorBufferInfo){g_gpt.buf, 0, g_gpt.size}; return 1;
 }
 // A compute program's shared memory past the device's limit (DMSH_VK_KIND_SHARED_SPILL; Ryujinx StructuredIr/SharedSpillInfo.cs): one buffer for the process
 // (DM_VK_SHARED_SPILL_MB, default 16 MiB, at least one slice), reused by every such dispatch: each dispatch ends with a barrier (vka_dispatch), so the next one finds it free.
@@ -585,6 +628,70 @@ static inline uint64_t cntvct(void) { uint64_t v; __asm__ volatile("mrs %0, cntv
 typedef struct { VkWriteDescriptorSet w[512]; VkDescriptorBufferInfo bi[512]; VkDescriptorImageInfo ii[512]; VkBufferView bv[512]; uint32_t n; } writes_t;
 static writes_t g_w;
 static vka_res g_res[512];   // the NaN scan's own walk (DM_VK_NANSCAN_FS)
+// Diagnostic DM_VK_KEYDUMP=<shader key>[:n] (Android, live through ctl.txt's env lines; the Metal host's DM_NVN_KEYDUMP): for the first n draws (default 4) that use that shader in any stage, each
+// stage's guest buffer bindings as the CPU sees them when the draw is recorded: binding, uniform or storage, address, size and the first 16 words as floats (GPU writes
+// still in flight are not in them; driver segments and the support buffer are the replay's own and left out)
+static uint64_t g_kd_key; static int g_kd_max; static uint32_t g_kd_gen; static _Atomic int g_kd_seen;
+// DM_VK_DRAW_SKIP=<key>,… (live: read again after a ctl.txt "env" line, at most 8 keys): draws with one of those shaders in any stage are not recorded, to time what they cost with DM_VK_GPUPROF
+static int draw_skip(vka_shader *const sh[VKA_NSTAGE]) {
+    static uint64_t key[8]; static int n; static uint32_t gen = ~0u;
+    uint32_t g = atomic_load(&vka_env_gen);
+    if (g != gen) {
+        gen = g; n = 0;
+        for (const char *e = getenv("DM_VK_DRAW_SKIP"); e && *e && n < 8;) { char *x; uint64_t k = strtoull(e, &x, 16); if (x == e) break; key[n++] = k; e = *x == ',' ? x + 1 : x; }
+    }
+    for (int i = 0; i < n; i++) for (int s = 0; s < VKA_NSTAGE; s++) if (sh[s] && sh[s]->key == key[i]) return 1;
+    return 0;
+}
+// DM_VK_TEXDUMP=<shader key>[:n] (live: an env line of ctl.txt starts the count over; default 4 draws): for the first n draws with that shader in any stage, each texture its pixel
+// shader samples is logged (texdump lines: format, size, flags, the image's state) and its storage's level 0 written to DM_TEMP (vka_tex_id_dump: as the CPU sees it, not a GPU render)
+static uint64_t g_td_key; static int g_td_max; static uint32_t g_td_gen = ~0u; static _Atomic int g_td_seen;
+static int texdump_draw(vka_shader *const sh[VKA_NSTAGE]) {
+    uint32_t gen = atomic_load(&vka_env_gen);
+    if (gen != g_td_gen) {
+        const char *e = getenv("DM_VK_TEXDUMP"); g_td_gen = gen; g_td_max = 0; atomic_store(&g_td_seen, 0);
+        if (e && *e) { g_td_key = strtoull(e, NULL, 16); const char *c = strchr(e, ':'); g_td_max = c ? atoi(c + 1) : 4; }
+    }
+    if (!g_td_max || atomic_load(&g_td_seen) >= g_td_max) return 0;
+    int hit = 0; for (int s = 0; s < VKA_NSTAGE; s++) hit |= sh[s] && sh[s]->key == g_td_key;
+    if (!hit) return 0;
+    int k = atomic_fetch_add(&g_td_seen, 1) + 1;
+    return k <= g_td_max ? k : 0;
+}
+static int keydump_draw(vka_shader *const sh[VKA_NSTAGE]) {   // the draw's number (1-based) when its bindings are to be dumped, else 0
+    uint32_t gen = atomic_load(&vka_env_gen);
+    if (gen != g_kd_gen) {   // read again after a ctl.txt "env" line (vka_ctl.c), which starts the count over: set it once in the scene to dump
+        const char *e = getenv("DM_VK_KEYDUMP"); g_kd_gen = gen; g_kd_max = 0; atomic_store(&g_kd_seen, 0);
+        if (e && *e) { g_kd_key = strtoull(e, NULL, 16); const char *c = strchr(e, ':'); g_kd_max = c ? atoi(c + 1) : 4; }
+    }
+    if (!g_kd_max || atomic_load(&g_kd_seen) >= g_kd_max) return 0;
+    int hit = 0; for (int s = 0; s < VKA_NSTAGE; s++) hit |= sh[s] && sh[s]->key == g_kd_key;
+    if (!hit) return 0;
+    int k = atomic_fetch_add(&g_kd_seen, 1) + 1;
+    return k <= g_kd_max ? k : 0;
+}
+static void keydump_stage(int draw, int st, const vka_shader *sh, const vka_res *r, int n) {
+    for (int i = 0; i < n; i++) {
+        if (r[i].what != VKA_R_BUF) continue;
+        float f[32] = {0}; if (r[i].addr) dm_guest_read_mapped(f, (uintptr_t)r[i].addr, sizeof f);
+        for (int h = 0; h < 2; h++)
+            VLOG("keydump %016llx draw %d stage %d (%016llx) binding %u %s addr %#llx size %#llx words %d-%d: %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g", (unsigned long long)g_kd_key, draw,
+                 st, (unsigned long long)sh->key, r[i].binding, r[i].desc == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ? "storage" : "uniform", (unsigned long long)r[i].addr,
+                 (unsigned long long)r[i].size, 16 * h, 16 * h + 15, f[16*h], f[16*h+1], f[16*h+2], f[16*h+3], f[16*h+4], f[16*h+5], f[16*h+6], f[16*h+7], f[16*h+8], f[16*h+9], f[16*h+10], f[16*h+11], f[16*h+12], f[16*h+13], f[16*h+14], f[16*h+15]);
+    }
+}
+static void keydump_vertices(int draw, const vka_dstate *d) {   // the draw's vertex attributes (NVN format, offset, stream) and each bound stream's stride and first 16 words as floats
+    char a[256] = ""; size_t o = 0;
+    for (int i = 0; i < d->nattr && i < 16 && o < sizeof a - 24; i++) o += (size_t)snprintf(a + o, sizeof a - o, " %d:%#x+%u@%u", i, d->attr[i].fmt, d->attr[i].offset, d->attr[i].stream);
+    VLOG("keydump %016llx draw %d vertex attributes%s", (unsigned long long)g_kd_key, draw, a);
+    for (int s = 0; s < 16; s++) {
+        if (!d->vbuf[s].address) continue;
+        float f[16] = {0}; dm_guest_read_mapped(f, (uintptr_t)d->vbuf[s].address, sizeof f);
+        VLOG("keydump %016llx draw %d stream %d addr %#llx size %#llx stride %u: %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g", (unsigned long long)g_kd_key, draw, s,
+             (unsigned long long)d->vbuf[s].address, (unsigned long long)d->vbuf[s].size, s < d->nstream ? d->stream[s].stride : 0u,
+             f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15]);
+    }
+}
 // One stage's results as descriptor writes. 0 = the draw cannot run (logged)
 static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const vka_res *r, int n, int pool, c0_at *c0) {
     for (int i = 0; i < n; i++) {
@@ -723,12 +830,15 @@ static int bind_sets(const vka_dstate *d, vka_shader *const sh[VKA_NSTAGE], cons
     g_w.n = 0;
     int any_pool = 0;
     uint64_t t1_ = g_prof ? cntvct() : 0;
+    int kd = keydump_draw(sh);
+    if (kd && sh[0]) keydump_vertices(kd, d);
     for (int st = 0; st < VKA_NSTAGE; st++) {
         vka_shader *s = sh[st]; if (!s) continue;
         if (st == 1 && d->rast_discard) continue;   // no fragments: its stage's records are not read (the layout keeps them unwritten: partially bound is not needed for push descriptors)
         int n = g_wk.n[st];
         if (n < 0) { static _Atomic int k; if (atomic_fetch_add(&k, 1) < 16) VRED("shader %016llx: %s; skipped", (unsigned long long)s->key, g_wk.why[st]); return 0; }
         any_pool |= g_wk.pool[st];
+        if (kd) keydump_stage(kd, st, s, g_wk.r[st], n);
         if (!stage_writes(d, st, s, g_wk.r[st], n, g_wk.pool[st], st == 5 ? c0 : NULL)) return 0;
     }
     if (g_prof) g_ps[1] += cntvct() - t1_;
@@ -992,7 +1102,19 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
         int on = R.on; vka_rp_end(); (void)on;
         vka_nan_inputs(g_cb, ims, bs, ts, m);
     }
+    { int td = texdump_draw(sh);   // DM_VK_TEXDUMP: the textures this draw's pixel shader samples, described and their storage written to files
+      if (td && sh[1] && !d->rast_discard) {
+          char why[8]; int n = vka_walk(&d->b, 1, sh[1]->e, sh[1]->b, sh[1]->lib->h->ssbo_align, 0, rd_cb, NULL, g_res, 512, NULL, why, sizeof why);
+          for (int i = 0; i < n; i++) if (g_res[i].what == VKA_R_TEX && g_res[i].tid) {
+              char desc[400]; vka_tex_id_desc(g_res[i].tid, desc, sizeof desc); vka_img *im = vka_tex_id_img(g_res[i].tid, g_cb);
+              VLOG("texdump %016llx draw %d binding %u texture ID %d sampler %d: %s; image inited %d gpu_owned %d track %d", (unsigned long long)g_td_key, td, g_res[i].binding,
+                   g_res[i].tid, g_res[i].sid, desc, im ? im->inited : -1, im ? im->gpu_owned : -1, im ? im->track : -1);
+              vka_tex_id_dump(g_res[i].tid);
+          } } }
     if (!rp_begin(rt, has_rt, d)) { g_skipped++; return; }
+    if (draw_skip(sh)) return;   // DM_VK_DRAW_SKIP: the pass stays open (its clears and loads stay), only the draw goes
+    if (vka_gp_active) { int32_t c = dw ? dw->count : di->count; int ni = dw ? dw->instances : di->instances;   // DM_VK_GPUPROF: the step's shader pairs and vertices (0 when the GPU has the count)
+        vka_gp_draw(sh[mesh ? 7 : 0]->key, d->rast_discard || !sh[1] ? 0 : sh[1]->key, ind || mesh || c <= 0 ? 0 : (uint64_t)c * (uint64_t)(ni > 1 ? ni : 1)); }
     if (!R.swrite && draw_writes(sh, d)) R.swrite = 1;   // (a game barrier in this pass from now on ends it: vka_rp_game_barrier)
     d->b.samples = R.samples;
     vka_gkey k; memset(&k, 0, V.vin_dyn ? offsetof(vka_gkey, va) : sizeof k);   // (va, vb: only without vertex input dynamic state, vin_build; the pipeline lookup reads no further then)

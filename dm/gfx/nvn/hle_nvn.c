@@ -1185,8 +1185,23 @@ NVN(nvnCommandBufferSetViewports, void, NVNcommandBuffer *c, int first, int n, c
 }
 NVN(nvnCommandBufferSetScissor, void, NVNcommandBuffer *c, int x, int y, int w, int h) { *REC(c, OP_SCISSOR, p_scissor) = (p_scissor){x, y, w, h}; }
 NVN(nvnCommandBufferSetDepthRange, void, NVNcommandBuffer *c, float n, float f) { *REC(c, OP_DEPTH_RANGE, p_depth_range) = (p_depth_range){n, f}; }
+// DM_NVN_PROGTRACE also where a traced program is bound (the code that uses it; ProgramSetShaders gives the code that made it), 64 binds at most
+static void prog_trace_bind(const void *p, const char *trace) {
+    prog_keys_t *k = pk_get(p, 0); if (!k) return;
+    for (int i = 0; i < 6; i++) {
+        if (!(k->ok >> i & 1)) continue;
+        char key[17]; for (int j = 0; j < 8; j++) snprintf(key + j * 2, 3, "%02x", k->key[i][j]);
+        if (!strstr(trace, key)) continue;
+        static _Atomic int n; if (atomic_fetch_add(&n, 1) >= 64) return;
+        LOG("[nvn] BindProgram key=%s program=%p", key, p);
+        dm_backtrace((uint64_t)__builtin_frame_address(0));
+        return;
+    }
+}
 NVN(nvnCommandBufferBindProgram, void, NVNcommandBuffer *c, const NVNprogram *p, int stages) {
     *REC(c, OP_BIND_PROGRAM, p_bind_program) = (p_bind_program){(const prog_t *)p, stages};
+    static const char *trace; static int trace_init; if (!trace_init) { trace = getenv("DM_NVN_PROGTRACE"); trace_init = 1; }
+    if (trace && p) prog_trace_bind(p, trace);
 }
 static void bind_state(NVNcommandBuffer *c, int kind, const void *st, size_t n) { p_bind_state *r = rec(c, OP_BIND_STATE, offsetof(p_bind_state, bytes) + n); r->kind = kind; memcpy(r->bytes, st, n); }   // only the state's own bytes (nvn_obj.h p_bind_state)
 NVN(nvnCommandBufferBindBlendState, void, NVNcommandBuffer *c, const NVNblendState *st) { bind_state(c, 0, st, sizeof(blend_st)); }
@@ -2723,6 +2738,8 @@ NVN_NOPROTO(nvnCommandBufferPushComputeConstants, void, NVNcommandBuffer *c, uin
 NVN_NOPROTO(nvnCommandBufferSetRecordingMode, void, NVNcommandBuffer *c, int mode) { (void)c; ONCE_LOG("nvnCommandBufferSetRecordingMode %d: the host records every command buffer alike", mode); }
 NVN_NOPROTO(nvnCommandBufferSetGeometryProcessingMode, void, NVNcommandBuffer *c, int mode) { (void)c; ONCE_LOG("nvnCommandBufferSetGeometryProcessingMode %d: no effect on Metal", mode); }
 NVN_NOPROTO(nvnCommandBufferSetComputeOverlapMode, void, NVNcommandBuffer *c, int mode) { (void)c; ONCE_LOG("nvnCommandBufferSetComputeOverlapMode %d: the host runs compute in submission order", mode); }
+// The Legend of Zelda: Ocarina of Time (SDK 22) sets 0x20 on its command buffers: a scheduling priority for their compute work, not what it computes
+NVN_NOPROTO(nvnCommandBufferSetComputeWorkloadPriority, void, NVNcommandBuffer *c, int priority) { (void)c; ONCE_LOG("nvnCommandBufferSetComputeWorkloadPriority %#x: the host runs compute in submission order", priority); }
 
 // nvnProgramSetSampleShading (NVN 53+): whether the program's fragment shader runs once per sample of a multisampled target. Metroid Prime Remastered sets it on its programs
 // (modes 0, 1 and 2, from CGraphicsDeviceContext's sample shading state). Metal has no such switch: a fragment function runs per sample when it reads the sample index ([[sample_id]],

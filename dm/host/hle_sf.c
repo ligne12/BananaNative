@@ -15,7 +15,8 @@
 #define SF_MAX 64
 static struct { char name[16]; int used, domain; unsigned seen; } g_sf[SF_MAX];
 static pthread_mutex_t g_sf_mu = PTHREAD_MUTEX_INITIALIZER;
-static const char *const sf_served[] = {"olsc:u"};
+// auddmg:u: SDK 22's audio client opens it at startup and aborts with Result 0xa99 (module 153, audio) when sm refuses it (The Legend of Zelda: Ocarina of Time, sdk+0x1f61ac)
+static const char *const sf_served[] = {"olsc:u", "auddmg:u"};
 
 static int sf_slot(uint32_t h) {
     unsigned i = h - SF_H0;
@@ -84,6 +85,7 @@ HLE_FORCE("_ZN2nn2sf4hipc15SendSyncRequestENS_3svc6HandleEPvm", "send a request 
     uint32_t magic = *(uint32_t *)(base + hin), ver = *(uint32_t *)(base + hin + 4), cmd = *(uint32_t *)(base + hin + 8);
     static int trace = -1; if (trace < 0) trace = getenv("DM_SF_TRACE") && atoi(getenv("DM_SF_TRACE"));
     if (trace) { char hx[3 * 0x80 + 1] = ""; for (unsigned k = 0; k < 0x80 && k < size; k++) snprintf(hx + 3 * k, 4, "%02x ", base[k]); LOG("sf: %s request: %s", g_sf[i].name, hx); }
+    if (type == 2) { memset(base, 0, 16); return RES_OK; }   // Close: the client gives the session up (its handle is closed next, h_sf_Close); nothing to answer
     if (type != 4 && type != 6) { LOG("[RED] sf: %s: HIPC message type %u not served", g_sf[i].name, type); return 0xe401u; }
     if (dtype == 2) { memset(base, 0, 16); return RES_OK; }   // a domain object closed: nothing to answer
     if (magic != 0x49434653) { LOG("[RED] sf: %s: request without SFCI (%#x)", g_sf[i].name, magic); return 0xe401u; }
@@ -96,5 +98,13 @@ HLE_FORCE("_ZN2nn2sf4hipc15SendSyncRequestENS_3svc6HandleEPvm", "send a request 
     m[1] = (uint32_t)((end - 8) / 4 < 0x3ff ? (end - 8) / 4 : 0x3ff);
     size_t out = 0x10 + (dom ? 16 : 0);
     uint32_t *o = (uint32_t *)(base + out); o[0] = 0x4f434653; o[1] = ver; o[2] = RES_OK; o[3] = 0;   // "SFCO"; a domain's out-object count before it stays 0
+    // A command whose output is an interface: on a session that is no domain the object comes back as a move handle in the special header (bit 31 of word 1; the header's
+    // move count at bits 5..8, the handle after it), here a new host session answered the same way. The special header and its handle take words 2-3, so the CMIF part
+    // stays at +0x10. auddmg:u command 0 makes the audio device manager's default proxy (nn::audio::devmgr::detail::InitializeImpl stores it at sdk+0xf37ee8 and calls
+    // through it later: ListVirtualDeviceNamesImpl crashed on the null pointer; The Legend of Zelda: Ocarina of Time)
+    if (!dom && !strcmp(g_sf[i].name, "auddmg:u") && cmd == 0) {
+        m[1] |= 1u << 31; m[2] = 1u << 5; m[3] = sf_new("auddmg:u/proxy", 0);
+        LOG("sf: auddmg:u command 0 → its proxy object as host session %#x", m[3]);
+    }
     return RES_OK;
 }

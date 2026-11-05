@@ -189,6 +189,11 @@ def bahs_shaders(d, label):
         if off + n > rsz: continue
         code, ctl = d[region + off:region + off + n], d[c:c + csz]
         st = nvn2_stage(ctl, code) if nvn2 else 'cs' if code[:4] == CS_MAGIC else sph_stage(code) if code[:4] == GFX_MAGIC else None
+        # The table scan matches any 16 bytes shaped like an entry: an NVN2 compute control section with a code area that starts with a graphics SPH is such a false match (compute
+        # code has no SPH; a real first instruction's predicate bits land in the SPH's shader type). The Legend of Zelda: Ocarina of Time's agl_common.sharcb@0x357f0 paired one with a
+        # vertex + pixel program (0400486024DEC000/README.md); its key, of control and code, was one no game binds, and the translator stopped on the SPH (as Ampere instruction 0x481)
+        if nvn2 and st == 'cs' and sph_stage(bytes(0x30) + code[:4]):
+            print(f'[RED] {label}#BAHS@{a:#x}: an NVN2 compute control section with a graphics code area (SPH {sph_stage(bytes(0x30) + code[:4])}): not a shader, left out', flush=True); continue
         if not st or check(label, st, ctl, code): continue
         out.append((f'{label}#BAHS@{a:#x}', st, ctl, code))
     bahs_variations(d, label, [o[0] for o in out])
@@ -2564,6 +2569,7 @@ def ue_shaders(d, label):
         out.append((f'{label}#UE{i}', st, ctl, code))
     return out
 
+MESH_POINT_SIZE = 4 + 4 * 32   # the point size's plane code in a mesh layout (MeshShaderInfo.PointSizePlane)
 def mesh_facts(key, st, ctl, code, keys, mesh_pairs):
     """The translator's layout of an NVN2 task / mesh program (dmsh_xlate job "mesh", Ryujinx StructuredIr/MeshShaderInfo.cs; after azmasm/switch2mac nx2_split.py, MIT):
     "local" the workgroup (control +0x58 threads), "mesh" [max vertices (+0x60), max primitives (+0x62), task memory bytes (+0x5a), the per-vertex planes, then -1 and the
@@ -2579,10 +2585,15 @@ def mesh_facts(key, st, ctl, code, keys, mesh_pairs):
     pairs = sorted(b for a, b, t in mesh_pairs if a == key)
     if not threads: return warn('control +0x58 thread count is 0')
     if st == 'ts': return {'local': [threads, 1, 1], 'shared': 0, 'mesh': [0, 0, payload], 'pair': pairs}
-    # the planes are counted from position and the generic vectors only: an output-map bit of another output (system values before position at 0x30..0x35 bits 0..3,
-    # colours / clip distances after the generics) would be a plane of its own and shift every one after it. None in Mario Kart World 1.8.0's 19 mesh programs
-    if any(code[0x30:0x35]) or code[0x35] & 0xf or any(code[0x46:0x50]): return warn('its SPH output map has outputs besides position and the generic vectors, whose planes are not known')
-    planes = [c for c in range(4) if code[0x35] >> (4 + c) & 1] + [4 + i for i in range(128) if code[0x36 + i // 8] >> (i % 8) & 1]
+    # the planes are counted from the point size, position and the generic vectors only: an output-map bit of another output (the system values before the point size at
+    # 0x30..0x35 bits 0..2, colours / clip distances after the generics) would be a plane of its own and shift every one after it. None in Mario Kart World 1.8.0's 19 mesh
+    # programs. The point size (byte 0x35 bit 3, attribute 0x6c) has its plane before the position's (0x70), as The Legend of Zelda: Ocarina of Time's point mesh
+    # 2582bd7ea6490d33 stores them: code 132 (Ryujinx MeshShaderInfo.PointSizePlane)
+    if any(code[0x30:0x35]) or code[0x35] & 0x7 or any(code[0x46:0x50]): return warn('its SPH output map has outputs besides the point size, position and the generic vectors, whose planes are not known')
+    planes = ([MESH_POINT_SIZE] if code[0x35] & 8 else []) + [c for c in range(4) if code[0x35] >> (4 + c) & 1] + [4 + i for i in range(128) if code[0x36 + i // 8] >> (i % 8) & 1]
+    # the output topology, control +0x5f: 3 triangles (every mesh program until this one), 1 points (one index byte a primitive at 4 + t), marked at the layout's end
+    topology = ctl[0x5f] if len(ctl) > 0x5f else 3
+    if topology not in (1, 3): return warn(f'output topology {topology} at control +0x5f (1 points and 3 triangles are known)')
     layout = [maxv, maxp, payload, *planes]
     flats, reads = set(), set()
     for ps in pairs:
@@ -2600,9 +2611,10 @@ def mesh_facts(key, st, ctl, code, keys, mesh_pairs):
     if flats and next(iter(flats)) != prim: print(f'[RED] mesh program {key}: per-primitive values {list(prim)} (second header) are not the flat inputs {list(next(iter(flats)))} of its pixel shaders {pairs}', flush=True)
     if prim: layout += [-1, *prim]
     # -2: generic vectors the pixel shaders read that the mesh writes neither per vertex nor per primitive, given as (0, 0, 0, 1) like a vertex shader's padded outputs
-    have = {(c - 4) // 4 for c in planes + list(prim) if c >= 4}
+    have = {(c - 4) // 4 for c in planes + list(prim) if 4 <= c < MESH_POINT_SIZE}
     pad = sorted(reads - have)
     if pad: layout += [-2, *pad]
+    if topology == 1: layout += [-4, 1]
     return {'local': [threads, 1, 1], 'shared': 0, 'mesh': layout, 'pair': pairs}
 
 def var_pairs(found):

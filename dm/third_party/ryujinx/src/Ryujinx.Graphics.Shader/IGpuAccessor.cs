@@ -223,6 +223,15 @@ namespace Ryujinx.Graphics.Shader
         }
 
         /// <summary>
+        /// nxnative: whether raw global memory (an address traced to no storage buffer) is found through the host's page table (dmsh_abi.h DMSH_GMEM_PT_*, the Android Vulkan
+        /// host) instead of a search of its memory pool table (DMSH_GMEM_MAP_*, the Apple hosts).
+        /// </summary>
+        bool QueryGmemPageTable()
+        {
+            return false;
+        }
+
+        /// <summary>
         /// Queries host's gather operation precision bits for biasing their coordinates. Zero means no bias.
         /// </summary>
         /// <returns>Bits of gather operation precision to use for coordinate bias</returns>

@@ -1643,6 +1643,14 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
                     dimensions++;
                 }
 
+                // TXQ's dimension query gives width, height and depth whatever the texture type: a component the type does not have is 1, as the texture header
+                // holds it (a 2D texture's depth, a 1D texture's height). Extracting it from the size vector was out of bounds, which spirv-val refuses
+                // (The Legend of Zelda: Ocarina of Time, 74 pixel shaders: 0400486024DEC000/README.md)
+                if (texOp.Index >= dimensions)
+                {
+                    return new OperationResult(AggregateType.S32, context.Constant(context.TypeS32(), 1));
+                }
+
                 SpvInstruction resultType = dimensions == 1 ? context.TypeS32() : context.TypeVector(context.TypeS32(), dimensions);
 
                 SpvInstruction result;

@@ -164,6 +164,20 @@ namespace Ryujinx.Graphics.Shader.Translation
             return Properties.AddLocalMemory(new MemoryDefinition(name, type, arrayLength));
         }
 
+        // nxnative: raw global memory's pool cache (GlobalToStorage.TryGenerateRawStorageOp), made by the first shader that needs it: an invocation's last pool found,
+        // {start lo, start hi, end lo, end hi, delta lo, delta hi}, zero-initialized (an empty range that holds no address)
+        private int _gmemPoolCacheId = -1;
+
+        public int GetGmemPoolCacheMemoryId()
+        {
+            if (_gmemPoolCacheId < 0)
+            {
+                _gmemPoolCacheId = Properties.AddLocalMemory(new MemoryDefinition("gmem_pool_cache", AggregateType.Array | AggregateType.U32, 6, zeroed: true));
+            }
+
+            return _gmemPoolCacheId;
+        }
+
         public int GetConstantBufferBinding(int slot)
         {
             SetBindingPair setAndBinding = _cbSlotToBindingMap[slot];

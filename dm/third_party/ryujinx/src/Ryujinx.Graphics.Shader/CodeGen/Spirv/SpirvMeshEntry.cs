@@ -51,13 +51,19 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
             SpvInstruction pOutF32 = context.TypePointer(StorageClass.Output, tF32), pOutVec4 = context.TypePointer(StorageClass.Output, tVec4);
 
             SpvInstruction posVar = null, idxVar = null;
+            bool hasPointSize = mesh.IsMesh && (mesh.Points || mesh.Planes.Contains(MeshShaderInfo.PointSizePlane));
             Dictionary<int, SpvInstruction> generics = new(), primGenerics = new();
 
             if (mesh.IsMesh)
             {
-                SpvInstruction perVertex = context.TypeStruct(true, tVec4);
+                // The point size beside the position for point primitives (which must write it) or a program whose planes name it (MeshShaderInfo.PointSizePlane)
+                SpvInstruction perVertex = hasPointSize ? context.TypeStruct(true, tVec4, tF32) : context.TypeStruct(true, tVec4);
                 context.Decorate(perVertex, Decoration.Block);
                 context.MemberDecorate(perVertex, 0, Decoration.BuiltIn, (SpvLiteralInteger)BuiltIn.Position);
+                if (hasPointSize)
+                {
+                    context.MemberDecorate(perVertex, 1, Decoration.BuiltIn, (SpvLiteralInteger)BuiltIn.PointSize);
+                }
                 posVar = context.Variable(context.TypePointer(StorageClass.Output, context.TypeArray(perVertex, U((uint)mesh.MaxVertices))), StorageClass.Output);
                 context.Name(posVar, "mesh_position");
                 context.AddGlobalVariable(posVar);
@@ -84,8 +90,8 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
                     io.Add(v);
                 }
 
-                idxVar = context.Variable(context.TypePointer(StorageClass.Output, context.TypeArray(tUVec3, U((uint)mesh.MaxPrimitives))), StorageClass.Output);
-                context.Decorate(idxVar, Decoration.BuiltIn, (SpvLiteralInteger)BuiltIn.PrimitiveTriangleIndicesEXT);
+                idxVar = context.Variable(context.TypePointer(StorageClass.Output, context.TypeArray(mesh.Points ? tU32 : tUVec3, U((uint)mesh.MaxPrimitives))), StorageClass.Output);
+                context.Decorate(idxVar, Decoration.BuiltIn, (SpvLiteralInteger)(mesh.Points ? BuiltIn.PrimitivePointIndicesEXT : BuiltIn.PrimitiveTriangleIndicesEXT));
                 context.AddGlobalVariable(idxVar);
                 io.Add(idxVar);
             }
@@ -163,13 +169,19 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
                 // position and the generic locations whose components the planes do not all name, and every per-primitive location
                 bool posFull = Enumerable.Range(0, 4).All(c => mesh.Planes.Contains(c));
                 List<SpvInstruction> vertexInit = generics.Where(kv => !Enumerable.Range(0, 4).All(c => mesh.Planes.Contains(4 + 4 * kv.Key + c))).Select(kv => kv.Value).ToList();
-                if (vertexInit.Count != 0 || !posFull)
+                bool sizeInit = hasPointSize && !mesh.Planes.Contains(MeshShaderInfo.PointSizePlane);   // 1, a point's default size
+                if (vertexInit.Count != 0 || !posFull || sizeInit)
                 {
                     ForEach(lid, mesh.MaxVertices, v =>
                     {
                         if (!posFull)
                         {
                             context.Store(context.AccessChain(pOutVec4, posVar, v, U(0)), init);
+                        }
+
+                        if (sizeInit)
+                        {
+                            context.Store(context.AccessChain(pOutF32, posVar, v, U(1)), context.Constant(tF32, 1f));
                         }
 
                         foreach (SpvInstruction g in vertexInit)
@@ -225,7 +237,16 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
                     return context.Select(tU32, context.ULessThan(tBool, b, U((uint)mesh.MaxVertices)), b, lastVertex);
                 }
 
-                ForEach(lid, mesh.MaxPrimitives, t =>
+                if (mesh.Points)   // one index byte a point, at 4 + t
+                {
+                    SpvInstruction pOutU32 = context.TypePointer(StorageClass.Output, tU32);
+                    ForEach(lid, mesh.MaxPrimitives, t =>
+                    {
+                        SpvInstruction i = context.Select(tU32, context.ULessThan(tBool, t, primCount), Index(context.IAdd(tU32, t, U(4))), U(0));
+                        context.Store(context.AccessChain(pOutU32, idxVar, t), i);
+                    });
+                }
+                else ForEach(lid, mesh.MaxPrimitives, t =>
                 {
                     SpvInstruction a = context.IAdd(tU32, context.IMul(tU32, t, U(3)), U(4));
                     SpvInstruction tri = context.CompositeConstruct(tUVec3, Index(a), Index(context.IAdd(tU32, a, U(1))), Index(context.IAdd(tU32, a, U(2))));
@@ -285,8 +306,8 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
                 SpvInstruction isVertex = context.ULessThan(tBool, word, U((uint)mesh.PrimitiveBaseWord));
                 Guarded(isVertex, () => Scatter(word, mesh.VertexChunkWords, mesh.MaxVertices, mesh.Planes, (v, plane) =>
                 {
-                    context.Store(plane < 4
-                        ? context.AccessChain(pOutF32, posVar, v, U(0), U((uint)plane))
+                    context.Store(plane == MeshShaderInfo.PointSizePlane ? context.AccessChain(pOutF32, posVar, v, U(1))
+                        : plane < 4 ? context.AccessChain(pOutF32, posVar, v, U(0), U((uint)plane))
                         : context.AccessChain(pOutF32, generics[(plane - 4) >> 2], v, U((uint)(plane & 3))), f);
 
                     if (zw != null && plane is 2 or 3)
@@ -326,7 +347,7 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
             {
                 context.AddExecutionMode(wrapper, ExecutionMode.OutputVertices, (SpvLiteralInteger)mesh.MaxVertices);
                 context.AddExecutionMode(wrapper, ExecutionMode.OutputPrimitivesEXT, (SpvLiteralInteger)mesh.MaxPrimitives);
-                context.AddExecutionMode(wrapper, ExecutionMode.OutputTrianglesEXT);
+                context.AddExecutionMode(wrapper, mesh.Points ? ExecutionMode.OutputPoints : ExecutionMode.OutputTrianglesEXT);
             }
         }
     }

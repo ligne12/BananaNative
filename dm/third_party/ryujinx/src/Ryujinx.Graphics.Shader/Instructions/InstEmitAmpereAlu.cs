@@ -35,6 +35,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             alu(0x107, InstName.F2f, AFrnd);
             alu(0x104, InstName.F2f, AF2f);
             alu(0x03e, InstName.F2f, AF2fp);
+            alu(0x043, InstName.F2i, AF2ip);
             alu(0x030, InstName.Hadd2, AHadd2);
             alu(0x032, InstName.Hmul2, AHmul2);
             alu(0x031, InstName.Hfma2, AHfma2);
@@ -431,6 +432,25 @@ namespace Ryujinx.Graphics.Shader.Instructions
             }
 
             ASet(context, x, context.PackHalf2x16(AFloat(context, b), AFloat(context, a)), AUniform(context));
+        }
+
+        // F2IP.U8.F32.NTZ Rd, a, b, RZ (base 0x043; nvdisasm's name for these encodings, CuAssembler's sm_86 tables): a and b to unsigned bytes, a to byte 1 and b to byte 0, as F2FP's
+        // a high / b low. Each is rounded to nearest, NaN to 0 (NTZ) and clamped to 0..255, as F2I. Seen only with these modifiers (74) and RZ in c: The Legend of Zelda: Ocarina of Time's
+        // RGB to YUV compute shaders pack Cr (a) and Cb (b), then PRMT 0x5410 joins two such pairs into one word (NV12 chroma order, Cb first)
+        public static void AF2ip(EmitterContext context)
+        {
+            AmpereOp x = new(context.CurrOp);
+
+            if (x.Bits(72, 92) != 0x4 || x.Rc != RegisterConsts.RegisterZeroIndex)
+            {
+                throw AFail(context, $"F2IP modifiers 0x{x.Bits(72, 92):x}, c R{x.Rc}");
+            }
+
+            (ASrc a, ASrc b) = ASecond(context, x, abs: false);
+
+            Operand Byte(ASrc s) => context.FP32ConvertToU32(context.FPMinimum(context.FPMaximum(context.FPRound(AFloat(context, s)), ConstF(0f)), ConstF(255f)));
+
+            ASet(context, x, context.BitwiseOr(context.ShiftLeft(Byte(a), Const(8)), Byte(b)), AUniform(context));
         }
 
         // ---- packed halves ----

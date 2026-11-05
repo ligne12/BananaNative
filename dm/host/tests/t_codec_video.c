@@ -140,7 +140,7 @@ int main(void) {
         assert(!h_cv_vp9fin(d9) && !cv_of(d9));
         memset(d9, 0, sizeof d9); assert(!h_cv_vp9init21r(d9, 0x10000, 16, 16, 1, 1, 3, 0) && cv_of(d9) && h_cv_vp9event21(d9) == d9 + CV_EVENT_OFF);
         assert(!h_cv_vp9fin(d9) && !cv_of(d9) && h_cv_vp9event21(d9) == NULL);
-        memset(d9, 0, sizeof d9); assert(h_cv_av1init21(d9) == CV_R(2004) && h_cv_av1init21r(d9) == CV_R(2004));
+        memset(d9, 0, sizeof d9); assert(h_cv_av1init21(d9, NULL, 0, 0x10000, 16, 16, 1, 1, 3, 0) == CV_R(2004) && h_cv_av1init21r(d9, 0x10000, 16, 16, 1, 1, 3, 0) == CV_R(2004) && !cv_of(d9));
         _Alignas(16) uint8_t pa[0x40]; memset(pa, 0x55, sizeof pa); assert(h_cv_aliaspool(pa) == CV_R(2004) && !pool_of(pa));
         h_cv_poolfin(p9);
     }
@@ -157,8 +157,8 @@ int main(void) {
         for (int i = 4096; i < 6144; i += 2) { assert(abs(yuv[i] - 90) <= 6); assert(abs(yuv[i + 1] - 240) <= 6); }
         assert(!h_cv_h264fin(dh) && !cv_of(dh)); h_cv_poolfin(ph);
     }
-    {   uint8_t da[0x400]; memset(da, 0xab, sizeof da);   // AV1: no decoder on the host, Initialize fails and leaves no host decoder
-        assert(h_cv_av1init(da) != 0 && !cv_of(da) && !h_cv_av1fin(da)); }
+    {   _Alignas(16) uint8_t da[0x400]; memset(da, 0xab, sizeof da);   // AV1: no decoder on this host (VideoToolbox here), Initialize fails and leaves no host decoder
+        assert(h_cv_av1init(da, NULL, 0, 0x10000, 64, 64, 1, 1, 3) != 0 && !cv_of(da) && !h_cv_av1fin(da)); }
     printf("t_codec_video: all passed\n");
     return 0;
 }

@@ -5,7 +5,8 @@
 #include "../front.h"
 #include <malloc.h>
 #include <stdatomic.h>
-void front_run(void (*guest)(void)) { LOG("front end: the guest runs on this thread; presents go to the launcher's window (nxhost_set_window)"); guest(); }
+void dm_pac_share(void);   // hle_thread.c
+void front_run(void (*guest)(void)) { LOG("front end: the guest runs on this thread; presents go to the launcher's window (nxhost_set_window)"); dm_pac_share(); guest(); }
 void *front_metal_layer(void) { return NULL; }
 int front_screen_max_fps(void) { return 0; }
 int front_screen_variable_refresh(void) { return 0; }

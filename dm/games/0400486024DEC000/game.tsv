@@ -1,0 +1,44 @@
+# The Legend of Zelda: Ocarina of Time (Switch 2, update v131072). In bring-up: not started on any device yet
+# Nintendo EPD's engine (sead / agl / gsys, Phive; the RomFS layout of Tears of the Kingdom: Banc, Chemical, Mals, RSDB, ActorSystem), SDK 22.2.8, NVN2;
+# modules main + subsdk0 (NintendoSDK_movie) + sdk. The modules are ZBIC-compressed (NSO flag bit 7, system 22.0.0 on: dm/tools/nso.py with the zbic package).
+# Shaders: Shader/*.Product.110.product.Nin_Ounce_NVN2.bfsha.zs (BNSH with Ampere code) and the layout shaders in Shader/ApplicationPackage.Nin_Ounce_NVN2.release.sarc.zs.
+# Survey (2026-11-05, from the .nup): sdk makes the same 57 SVC calls as Donkey Kong Bananza's; the rewrite sites are of the kinds the rewriter handles (x18, tpidr*, cntpct);
+# main imports 1,183 functions, 659 of them also imported by Donkey Kong Bananza's main
+
+# ---- Identity ----
+title_id	0400486024DEC000
+program_id	0400486024DEC000
+
+# ---- App ----
+name	The Legend of Zelda: Ocarina of Time
+ipa	ZeldaOcarinaOfTime.ipa
+app_category	public.app-category.adventure-games
+pad_layout	full
+
+# ---- Versions ----
+build	v131072	v131072	main=e0f3ccfaf50065ae4ea01eb5aeb13b1a	subsdk0=b0110087a7b339ef74588d3bd0b4dd5d	sdk=1643a838814f9c10c696f930ed681e7f
+package	v131072
+shader_versions	v131072
+
+# ---- Files ----
+modules	main subsdk0 sdk
+romfs_marker	Pack/Bootup.Nin_Ounce_NVN2.pack.zs
+zip_store	.zs:.bwav:.mc:.webm:.metallib
+
+# ---- Memory ----
+# Not measured yet. The NPDM declares 48 MB of system resource, so IsVirtualAddressMemoryEnabled is true and the game's memory lives in the alias region, as Mario Kart
+# World's (0400C3F00006E000/game.tsv, 64 MB): its layout until this game's own is known, with the Switch 2's 9 GB pool (the guessed Switch 1 pool, 3.2 GB, did not hold
+# Donkey Kong Bananza's heaps). 256 MB in front + 4 GB alias region + 256 MB stack region + the heap region
+mem_reserve	0x300000000
+mem_alias	0x100000000
+mem_stack	0x10000000
+app_pool	0x240000000
+sys_resource	0x3000000
+
+# ---- Graphics ----
+# agl's render buffer binding wraps its clears in render conditions in Donkey Kong Bananza and Tears of the Kingdom (the same engine): on until this game shows otherwise
+render_cond	on
+
+# ---- Shader split (shader_split.py) ----
+shader_groups	/Shader/ApplicationPackage=layout /Shader/=shader /Effect/=effect /UI/=layout
+shader_note	Ocarina of Time shaders

@@ -102,6 +102,15 @@ Guest threads, their synchronization and how the host schedules them. Each entry
 - **Fix:** `crash.c` lets only the first crashing thread print (`crash_gate`); the others stop in `pause()`, and a 15 s alarm ends the process if the dump itself stalls.
 - **Found on:** Unity titles in general.
 
+### Pointer authentication keys differ per thread on Android
+
+- **Symptom:** `CRASH sig=4` at `autiasp` in `nn::os::detail::DispatchFiberContext` (The Legend of Zelda: Ocarina of Time, `sdk+0x16d40c`) the first time an `nn::os` fiber runs; the fiber's integrity hash (`pacga`), checked just before, passes.
+- **Cause:** Android 13 (kernel 5.15, AYN Thor) gives every thread its own address keys: one value signed with the IA key on each guest thread gave a different signature on each. Horizon has one key set per process. `FiberImplByHorizon::Initialize` signs the fiber's entry with `pacia` (modifier: the top of the fiber's stack) on the thread that makes the fiber, and `DispatchFiberContext` authenticates it with `autiasp` on the thread that first runs it. FPAC turns the failed authentication into SIGILL at the instruction. The hash's generic key (GA) is the same on every thread, so the hash passes.
+- **Fix:** `dm_pac_share` (`dm/host/hle_thread.c`) turns the IA, IB, DA and DB keys off (`PR_PAC_SET_ENABLED_KEYS`) on each guest thread before its first guest instruction (`thread_main`; `front_run` on Android for the main thread). `pac*` then leave a pointer as it is and `aut*` check nothing, the same on every thread. This is safe only because no host frame below that point signs its return address: in `libnxhost` only compiler-rt's load-time constructors use `paciasp`. The log prints `pac: address keys off on the guest threads` once, and a red line on a thread where the call fails.
+- **Check:** Zelda on the Thor: the fibers run and the game reaches its title menu.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) (SDK 22.2.8): its gRPC (`npln-grpc`) and `nn::async` fibers.
+- **Open:** Donkey Kong Bananza and the other Android games not rerun with the change; Apple platforms do not call it.
+
 ## Synchronization and address arbitration
 
 ### `SignalToAddress` type 2 with count ≤ 0

@@ -412,6 +412,19 @@ void mtl_prog_release(prog_t *p) {
 }
 void mtl_prog_prefetch(const prog_t *p) { (void)p; }   // modules are made at the program's first draw (vka_prog_shaders)
 
+// DM_NVN_SHDUMP=<dir>, as on the Mac (nvn_mtl.m): a shader missing from the library is saved as <key>.ctl (its control section, hle_nvn.c's copy kept under the same switch)
+// and <key>.code (its code area), which shader_split.py adds to the map (DM_NVN_SHDUMP_DIR, nvn_dumps) and runtime_shaders.py --dump locates in the files
+static void shdump(const prog_t *p, unsigned i, uint64_t key) {
+    static const char *dir; static int init; if (!init) { dir = getenv("DM_NVN_SHDUMP"); init = 1; if (dir && *dir) mkdir(dir, 0777); }
+    if (!dir || !*dir || !p->sd[i].control) return;
+    uint32_t nctl, ncode; nvn_ctl_lens(p->sd[i].control, &nctl, &ncode);
+    if (nctl == 0x48) nctl = 0xd8;   // NVN2: the whole 0xd8-byte section (the split reads its stage byte and thread group), as nvn_mtl.m saves it
+    char path[1024]; FILE *f;
+    snprintf(path, sizeof path, "%s/%016llx.ctl", dir, (unsigned long long)key);
+    if ((f = fopen(path, "wb"))) { fwrite(p->sd[i].control, 1, nctl, f); fclose(f); } else { static _Atomic int n; if (!atomic_fetch_add(&n, 1)) VRED("DM_NVN_SHDUMP: cannot write %s", path); }
+    snprintf(path, sizeof path, "%s/%016llx.code", dir, (unsigned long long)key);
+    if (p->sd[i].data && ncode && ncode < (1u << 24) && (f = fopen(path, "wb"))) { fwrite((const void *)(uintptr_t)p->sd[i].data, 1, ncode, f); fclose(f); }
+}
 int vka_prog_shaders(const prog_t *p, vka_progsh *out) {
     memset(out, 0, sizeof *out);
     if (!p || !p->serial) return 0;
@@ -424,7 +437,7 @@ int vka_prog_shaders(const prog_t *p, vka_progsh *out) {
         if (!prog_key(p, i, md)) continue;
         uint64_t key = vka_shlib_key(md);
         const dmsh_vk_entry *en = vka_shlib_find(&g_lib, key);
-        if (!en) { out->bad |= VKA_BAD_MISSING; static _Atomic int n; if (atomic_fetch_add(&n, 1) < 32) VRED("shader %016llx (program stage %u) is not in the shader library", (unsigned long long)key, i); continue; }
+        if (!en) { out->bad |= VKA_BAD_MISSING; static _Atomic int n; if (atomic_fetch_add(&n, 1) < 32) VRED("shader %016llx (program stage %u) is not in the shader library (DM_NVN_SHDUMP=<dir> saves it)", (unsigned long long)key, i); shdump(p, i, key); continue; }
         int st = vka_nvn_stage(en->stage);
         if (st < 0) { out->bad |= VKA_BAD_MISSING; continue; }   // (vka_shlib_open refuses a stage past DMSH_VK_STAGE_MS)
         if (out->sh[st]) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) VRED("program serial %llu has two %s shaders (%016llx, %016llx): the second is used", (unsigned long long)p->serial, stage_name(en->stage), (unsigned long long)out->sh[st]->key, (unsigned long long)key); }

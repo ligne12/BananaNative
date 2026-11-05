@@ -36,7 +36,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
         // The stage memories by the mode word (instruction bits 64..95), as nx2_lower numbers its windows:
         //   1 0x923 / 0x7800  the invocation's header word, address 0 (task and mesh): the workgroup's index
         //   2 0x923 / 0x3800  mesh: the task memory its task wrote (word 0 the mesh workgroup's index, records from 0x10)
-        //   3 0x927 / 0xb800  task: the task memory (+4 = the mesh workgroups to launch)
+        //   3 0x927 / 0xb800  task: the task memory (+4 = the mesh workgroups to launch); 0x923 / 0xb800 reads it back
         //   4 0x927 / 0xf800  mesh: the per-vertex planes (one 0x80-byte plane per output component, 32 vertices a chunk), then the per-primitive values
         //   5 0x927 / 0x8000  mesh: the primitive index bytes (4 + 3 t ...), 8-bit stores
         //   6 0x927 / 0x8800  mesh: the counts header (byte 3 = the primitive count), 8-bit stores
@@ -82,7 +82,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             int offset = x.Bits(40, 64);
 
             AStageWindow window = load
-                ? mode switch { 0x7800 => AStageWindow.Header, 0x3800 => AStageWindow.TaskMemoryRead, _ => AStageWindow.None }
+                ? mode switch { 0x7800 => AStageWindow.Header, 0x3800 => AStageWindow.TaskMemoryRead, 0xb800 => AStageWindow.TaskMemoryWrite, _ => AStageWindow.None }
                 : mode switch { 0xb800 => AStageWindow.TaskMemoryWrite, 0xf800 => AStageWindow.VertexPlanes, 0x8000 => AStageWindow.PrimitiveIndices, 0x8800 => AStageWindow.PrimitiveHeader, _ => AStageWindow.None };
 
             if (window == AStageWindow.None)
@@ -140,6 +140,16 @@ namespace Ryujinx.Graphics.Shader.Instructions
                         Operand word = context.ShiftRightU32(context.BitwiseAnd(address, Const(mesh.PayloadWords * 4 - 1)), Const(2));
                         Operand loaded = context.Load(StorageKind.SharedMemory, mesh.PayloadMemoryId, word);
                         ASet(context, x, x.Ra == RegisterConsts.RegisterZeroIndex ? loaded : context.ConditionalSelect(context.ICompareEqual(word, Const(0)), index, loaded));
+                    }
+
+                    return;
+
+                case AStageWindow.TaskMemoryWrite when load:
+                    // A task program reading back its own task memory (0x923 / 0xb800: The Legend of Zelda: Ocarina of Time's task 5d3a096025e375a1): the payload its stores write,
+                    // which a task may read in SPV_EXT_mesh_shader (taskPayloadSharedEXT)
+                    if (x.Rd != RegisterConsts.RegisterZeroIndex)
+                    {
+                        ASet(context, x, context.Load(StorageKind.SharedMemory, mesh.PayloadMemoryId, context.ShiftRightU32(context.BitwiseAnd(address, Const(mesh.PayloadWords * 4 - 1)), Const(2))));
                     }
 
                     return;

@@ -785,6 +785,15 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
         public const int GmemMapCbSlot = 0xff;
         private const int GmemMapLog2 = 12;
         private const int GmemMapEntryWords = 8;
+        private const int GmemMapSpanWord = 6;   // entry 0's word 6 (dmsh_abi.h DMSH_GMEM_MAP_SPAN_WORD): the search's first step is 1 << (GmemMapLog2 - 1) shifted right by it (0: the whole table)
+
+        // nxnative: the Android host's page table in the same binding (IGpuAccessor.QueryGmemPageTable; dmsh_abi.h DMSH_GMEM_PT_*): words 0 to 1023 the null level 2 block (zeros),
+        // from GmemPtL1Word one level 1 word for each 2 MiB block of the 39-bit address space (the word index of its level 2 array; 0 the null block), then the level 2 arrays:
+        // two words for each 4 KiB page, the delta of the pool holding it with bit 0 set (deltas are even), or 0
+        private const int GmemPtL1Word = 1024;
+        private const int GmemPtVaBits = 39;
+        private const int GmemPtBlockLog2 = 21;
+        private const int GmemPtPageLog2 = 12;
 
         // nxnative: the write log (dmsh_abi.h DMSH_GMEM_LOG_*), reserved under the same sentinel slot at offset 1: the set of guest pages (address >> 12) the stores and atomics wrote,
         // as an open-addressing hash set of 1 << GmemLogLog2 words from word 1 (0 = empty), word 0 set when a page found no free slot in GmemLogProbes tries. The host cannot know where
@@ -853,12 +862,68 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                 return context.Load(StorageKind.StorageBuffer, mapBinding, Const(0), context.IAdd(entry, Const(word)));
             }
 
-            // The last entry whose start is at or below the address (entry 0 starts at 0, so there always is one)
-            Operand index = Const(0);
+            Operand deltaLow = Local();
+            Operand deltaHigh = Local();
+            Operand lblSkip = Label();
 
-            for (int step = 1 << (GmemMapLog2 - 1); step != 0; step >>= 1)
+            if (gpuAccessor.QueryGmemPageTable())
             {
-                Operand candidate = context.IAdd(index, Const(step));
+                // The Android host's page table (dmsh_abi.h DMSH_GMEM_PT_*): a level 1 word for each 2 MiB of the 39-bit address space holds the word index of that block's
+                // level 2 array (0: the null block), whose two words for each 4 KiB page are the pool's delta with bit 0 set, or 0 outside every pool. Three loads an access,
+                // with no loop and no per-invocation state. The search below (12 steps and the pool cache) made one Ocarina of Time vertex shader with 253 accesses 50,769
+                // instructions long once Turnip had inlined each, about half of them branches; its two draws took 21 ms of a frame's 40 ms of GPU on the AYN Thor
+                Operand inSpace = context.ICompareLessUnsigned(addrHigh, Const(1 << (GmemPtVaBits - 32)));
+                Operand l1 = context.ConditionalSelect(inSpace, context.BitwiseOr(context.ShiftLeft(addrHigh, Const(32 - GmemPtBlockLog2)), context.ShiftRightU32(addrLow, Const(GmemPtBlockLog2))), Const(0));
+                Operand block = MapWord(l1, GmemPtL1Word);
+                Operand page = context.BitwiseAnd(context.ShiftRightU32(addrLow, Const(GmemPtPageLog2)), Const((1 << (GmemPtBlockLog2 - GmemPtPageLog2)) - 1));
+                Operand pageEntry = context.IAdd(block, context.ShiftLeft(page, Const(1)));
+                Operand ptLow = MapWord(pageEntry, 0);
+                context.Copy(deltaHigh, MapWord(pageEntry, 1));
+                context.BranchIfFalse(lblSkip, context.ICompareNotEqual(context.BitwiseAnd(ptLow, Const(1)), Const(0)));
+                context.Copy(deltaLow, context.BitwiseAnd(ptLow, Const(~1)));
+            }
+            else
+            {
+                // The invocation's last pool found (ResourceManager.GetGmemPoolCacheMemoryId: start, end and delta, zero at first: an empty range): an address in it takes its delta
+                // without the search. A shader's accesses mostly fall in a few pools, and the search costs about 26 loads an access: one Ocarina of Time fragment shader makes 253 of
+                // them a pixel, and its pass took 184 ms of GPU a frame on the AYN Thor
+                int cacheId = resourceManager.GetGmemPoolCacheMemoryId();
+
+                Operand CacheWord(int word)
+                {
+                    return context.Load(StorageKind.LocalMemory, cacheId, Const(word));
+                }
+
+                Operand lblFound = Label();
+
+                Operand cacheStartLow = CacheWord(0);
+                Operand cacheStartHigh = CacheWord(1);
+                Operand cacheEndLow = CacheWord(2);
+                Operand cacheEndHigh = CacheWord(3);
+
+                Operand afterCacheStart = context.BitwiseOr(
+                    context.ICompareLessUnsigned(cacheStartHigh, addrHigh),
+                    context.BitwiseAnd(context.ICompareEqual(cacheStartHigh, addrHigh), context.ICompareLessOrEqualUnsigned(cacheStartLow, addrLow)));
+                Operand beforeCacheEnd = context.BitwiseOr(
+                    context.ICompareLessUnsigned(addrHigh, cacheEndHigh),
+                    context.BitwiseAnd(context.ICompareEqual(addrHigh, cacheEndHigh), context.ICompareLessUnsigned(addrLow, cacheEndLow)));
+
+                context.Copy(deltaLow, CacheWord(4));
+                context.Copy(deltaHigh, CacheWord(5));
+                context.BranchIfTrue(lblFound, context.BitwiseAnd(afterCacheStart, beforeCacheEnd));
+
+                // The last entry whose start is at or below the address (entry 0 starts at 0, so there always is one), by a loop the driver cannot unroll: its first step is shifted
+                // right by entry 0's word 6 (DMSH_GMEM_MAP_SPAN_WORD), which the hosts leave 0, so the trip count is a value only known when the shader runs. Unrolled (12 steps,
+                // 2 loads each) and inlined by the driver into each of a shader's accesses, it made one Ocarina of Time fragment shader with 253 such accesses take 5 s to compile on Turnip
+                Operand index = Local();
+                Operand step = Local();
+                context.Copy(index, Const(0));
+                context.Copy(step, context.ShiftRightU32(Const(1 << (GmemMapLog2 - 1)), MapWord(Const(0), GmemMapSpanWord)));
+
+                Operand lblSearch = Label();
+                context.MarkLabel(lblSearch);
+
+                Operand candidate = context.IAdd(index, step);
                 Operand entry = context.IMultiply(candidate, Const(GmemMapEntryWords));
                 Operand startLow = MapWord(entry, 0);
                 Operand startHigh = MapWord(entry, 1);
@@ -867,19 +932,31 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                     context.ICompareLessUnsigned(startHigh, addrHigh),
                     context.BitwiseAnd(context.ICompareEqual(startHigh, addrHigh), context.ICompareLessOrEqualUnsigned(startLow, addrLow)));
 
-                index = context.ConditionalSelect(atOrBelow, candidate, index);
+                context.Copy(index, context.ConditionalSelect(atOrBelow, candidate, index));
+                context.Copy(step, context.ShiftRightU32(step, Const(1)));
+                context.BranchIfTrue(lblSearch, context.ICompareNotEqual(step, Const(0)));
+
+                Operand found = context.IMultiply(index, Const(GmemMapEntryWords));
+                Operand endLow = MapWord(found, 2);
+                Operand endHigh = MapWord(found, 3);
+
+                Operand inPool = context.BitwiseOr(
+                    context.ICompareLessUnsigned(addrHigh, endHigh),
+                    context.BitwiseAnd(context.ICompareEqual(addrHigh, endHigh), context.ICompareLessUnsigned(addrLow, endLow)));
+
+                context.BranchIfFalse(lblSkip, inPool);
+
+                context.Copy(deltaLow, MapWord(found, 4));
+                context.Copy(deltaHigh, MapWord(found, 5));
+                context.Store(StorageKind.LocalMemory, cacheId, Const(0), MapWord(found, 0));
+                context.Store(StorageKind.LocalMemory, cacheId, Const(1), MapWord(found, 1));
+                context.Store(StorageKind.LocalMemory, cacheId, Const(2), endLow);
+                context.Store(StorageKind.LocalMemory, cacheId, Const(3), endHigh);
+                context.Store(StorageKind.LocalMemory, cacheId, Const(4), deltaLow);
+                context.Store(StorageKind.LocalMemory, cacheId, Const(5), deltaHigh);
+
+                context.MarkLabel(lblFound);
             }
-
-            Operand found = context.IMultiply(index, Const(GmemMapEntryWords));
-            Operand endLow = MapWord(found, 2);
-            Operand endHigh = MapWord(found, 3);
-
-            Operand inPool = context.BitwiseOr(
-                context.ICompareLessUnsigned(addrHigh, endHigh),
-                context.BitwiseAnd(context.ICompareEqual(addrHigh, endHigh), context.ICompareLessUnsigned(addrLow, endLow)));
-
-            Operand lblSkip = Label();
-            context.BranchIfFalse(lblSkip, inPool);
 
             if (writes)
             {
@@ -902,9 +979,9 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
             // A small integer is read or written in its 32-bit word
             Operand wordLow = isSmall ? context.BitwiseAnd(addrLow, Const(~3)) : addrLow;
-            Operand hostLow = context.IAdd(wordLow, MapWord(found, 4));
+            Operand hostLow = context.IAdd(wordLow, deltaLow);
             Operand carry = context.ConditionalSelect(context.ICompareLessUnsigned(hostLow, wordLow), Const(1), Const(0));
-            Operand hostHigh = context.IAdd(context.IAdd(addrHigh, MapWord(found, 5)), carry);
+            Operand hostHigh = context.IAdd(context.IAdd(addrHigh, deltaHigh), carry);
 
             Operand resultValue = null;
 

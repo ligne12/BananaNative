@@ -2,7 +2,9 @@
 // copied out through the output format's stride, slice height and crop (av_android.h). The interface is the one hle_movie_avc.c gives on VideoToolbox: SPS / PPS from Configure
 // (csd-0 / csd-1, Annex B or length-prefixed) or the avcC box, or from the stream; one access unit per mavc_decode; pictures in presentation order from mavc_take, all of them with flush.
 // MediaCodec reorders by itself and its pictures come in presentation order, so no reorder queue is needed: a picture is handed out as soon as the decoder gives it. The decoder is
-// asynchronous inside: mavc_decode waits briefly for a picture while none is held, and a flush sends end-of-stream and drains. A new SPS / PPS makes a new decoder, as on Apple
+// asynchronous inside: mavc_decode waits briefly for a picture while none is held, and a flush sends end-of-stream and drains. A new SPS / PPS makes a new decoder, as on Apple.
+// AV1 (mavc_new_av1) goes through the same decoder as "video/av01" (Android 10 and later: the phone's own or Codec2's software one): a packet is one temporal unit as the stream
+// has it (its OBUs, one shown picture each), no parameter sets; the decoder is configured at the size the client gave
 #include "../dm.h"
 #include "../hle_movie_avc.h"
 #include "../android/av_android.h"
@@ -19,8 +21,9 @@ struct mavc {
     struct { uint8_t *nv12; int w, h; int64_t pts; } q[QMAX]; int nq;
     int pending, eos_sent, eos_done;
     uint8_t *au; size_t aucap;
-    int red, red_fmt, rgba;
+    int red, red_fmt, rgba, av1;
 };
+#define KIND(a) ((a)->av1 ? "AV1" : "AVC")
 
 mavc *mavc_new(void) { mavc *a = calloc(1, sizeof *a); if (!a) die("movie: AVC decoder allocation failed"); return a; }
 static void close_codec(mavc *a) { if (a->c) { AMediaCodec_stop(a->c); AMediaCodec_delete(a->c); a->c = NULL; } a->pending = a->eos_sent = a->eos_done = 0; }
@@ -31,6 +34,7 @@ void mavc_drop(mavc *a) {
     a->pending = a->eos_sent = a->eos_done = 0;
 }
 void mavc_free(mavc *a) { if (!a) return; mavc_drop(a); close_codec(a); free(a->au); free(a); }
+mavc *mavc_new_av1(int w, int h) { mavc *a = mavc_new(); a->av1 = 1; a->cw = w > 0 ? w : 1920; a->chh = h > 0 ? h : 1080; return a; }
 int mavc_queued(const mavc *a) { return a->nq; }
 void mavc_set_rgba(mavc *a) { if (a) a->rgba = 1; }   // converted at mavc_take: the decoder stays as it is
 
@@ -70,26 +74,30 @@ void mavc_avcc(mavc *a, const uint8_t *p, size_t n) {
 
 static int open_codec(mavc *a) {
     close_codec(a);
-    if (!a->nsps || !a->npps) { if (!a->red++) LOG("[RED] movie: AVC has no SPS / PPS, no pictures"); return 0; }
-    int w = 1920, h = 1080; if (!avc_sps_size(a->sps, (size_t)a->nsps, &w, &h) && !a->red++) LOG("[RED] movie: AVC SPS size not readable, configuring 1920×1080");
-    a->c = AMediaCodec_createDecoderByType("video/avc");
-    if (!a->c) { if (!a->red++) LOG("[RED] movie: the phone has no H.264 decoder (video/avc), no pictures"); return 0; }
+    const char *mime = a->av1 ? "video/av01" : "video/avc";
+    int w = a->cw, h = a->chh;
+    if (!a->av1) {
+        if (!a->nsps || !a->npps) { if (!a->red++) LOG("[RED] movie: AVC has no SPS / PPS, no pictures"); return 0; }
+        w = 1920; h = 1080; if (!avc_sps_size(a->sps, (size_t)a->nsps, &w, &h) && !a->red++) LOG("[RED] movie: AVC SPS size not readable, configuring 1920×1080");
+    }
+    a->c = AMediaCodec_createDecoderByType(mime);
+    if (!a->c) { if (!a->red++) LOG("[RED] movie: the phone has no %s decoder (%s), no pictures", KIND(a), mime); return 0; }
     uint8_t csd[2][4 + 512]; static const uint8_t sc[4] = {0, 0, 0, 1};
     memcpy(csd[0], sc, 4); memcpy(csd[0] + 4, a->sps, (size_t)a->nsps); memcpy(csd[1], sc, 4); memcpy(csd[1] + 4, a->pps, (size_t)a->npps);
     AMediaFormat *f = AMediaFormat_new();
-    AMediaFormat_setString(f, AMEDIAFORMAT_KEY_MIME, "video/avc");
+    AMediaFormat_setString(f, AMEDIAFORMAT_KEY_MIME, mime);
     AMediaFormat_setInt32(f, AMEDIAFORMAT_KEY_WIDTH, w); AMediaFormat_setInt32(f, AMEDIAFORMAT_KEY_HEIGHT, h);
     AMediaFormat_setInt32(f, AMEDIAFORMAT_KEY_COLOR_FORMAT, 21);   // COLOR_FormatYUV420SemiPlanar: NV12 in the ByteBuffer, which Codec2 converts to when asked
     AMediaFormat_setInt32(f, AMEDIAFORMAT_KEY_MAX_INPUT_SIZE, w * h * 3 / 2 > (1 << 20) ? w * h * 3 / 2 : 1 << 20);
-    AMediaFormat_setBuffer(f, "csd-0", csd[0], 4 + (size_t)a->nsps); AMediaFormat_setBuffer(f, "csd-1", csd[1], 4 + (size_t)a->npps);
+    if (!a->av1) { AMediaFormat_setBuffer(f, "csd-0", csd[0], 4 + (size_t)a->nsps); AMediaFormat_setBuffer(f, "csd-1", csd[1], 4 + (size_t)a->npps); }
     media_status_t st = AMediaCodec_configure(a->c, f, NULL, NULL, 0);
     AMediaFormat_delete(f);
     if (st == AMEDIA_OK) st = AMediaCodec_start(a->c);
-    if (st != AMEDIA_OK) { if (!a->red++) LOG("[RED] movie: AMediaCodec refuses the AVC configuration (%d, %d×%d), no pictures", (int)st, w, h); AMediaCodec_delete(a->c); a->c = NULL; return 0; }
+    if (st != AMEDIA_OK) { if (!a->red++) LOG("[RED] movie: AMediaCodec refuses the %s configuration (%d, %d×%d), no pictures", KIND(a), (int)st, w, h); AMediaCodec_delete(a->c); a->c = NULL; return 0; }
     char *name = NULL; AMediaCodec_getName(a->c, &name); snprintf(a->name, sizeof a->name, "%s", name ? name : "AMediaCodec"); if (name) AMediaCodec_releaseName(a->c, name);
     a->cw = w; a->chh = h;
     a->L = (nx_yuv_layout){NXYUV_NV12, w, h, 0, 0, w, h}; a->bt709 = h >= 720; a->full = 0;
-    LOG("[movie] AVC: %s decoding %d×%d, profile %d", a->name, w, h, a->nsps > 1 ? a->sps[1] : 0);
+    LOG("[movie] %s: %s decoding %d×%d, profile %d", KIND(a), a->name, w, h, !a->av1 && a->nsps > 1 ? a->sps[1] : 0);
     a->dirty = 0; return 1;
 }
 static void out_format(mavc *a) {
@@ -108,7 +116,7 @@ static void out_format(mavc *a) {
     a->full = AMediaFormat_getInt32(f, AMEDIAFORMAT_KEY_COLOR_RANGE, &v) && v == 1;      // COLOR_RANGE_FULL
     AMediaFormat_delete(f);
     if (a->L.kind == NXYUV_NONE && !a->red_fmt++) LOG("[RED] movie: %s outputs colour format %#x, which the host cannot read: no pictures", a->name, cf);
-    LOG("[movie] AVC output: %d×%d (crop %d,%d %d×%d), stride %d, slice height %d, colour format %#x, %s %s range", w, h, l, t, a->L.cw, a->L.ch, stride, slice, cf,
+    LOG("[movie] %s output: %d×%d (crop %d,%d %d×%d), stride %d, slice height %d, colour format %#x, %s %s range", KIND(a), w, h, l, t, a->L.cw, a->L.ch, stride, slice, cf,
         a->bt709 ? "BT.709" : "BT.601", a->full ? "full" : "limited");
 }
 static void keep_picture(mavc *a, const uint8_t *p, size_t n, int64_t pts) {
@@ -153,16 +161,18 @@ static void au_add(void *ctx, const uint8_t *nal, size_t n) {   // the access un
     uint8_t *o = a->au + c->len; o[0] = o[1] = o[2] = 0; o[3] = 1; memcpy(o + 4, nal, n); c->len += 4 + n;
 }
 int mavc_decode(mavc *a, const uint8_t *p, int n, int64_t pts_us) {
-    au_ctx c = {a, 0, 0}; each_nal(p, (size_t)n, au_add, &c);
-    if (!c.len) return 0;
+    au_ctx c = {a, 0, 0};
+    if (a->av1) c.picture = n > 0; else each_nal(p, (size_t)n, au_add, &c);
+    const uint8_t *src = a->av1 ? p : a->au; size_t len = a->av1 ? (size_t)n : c.len;
+    if (!len) return 0;
     if ((a->dirty || !a->c) && !open_codec(a)) return -1;
     if (a->eos_sent) { AMediaCodec_flush(a->c); a->pending = a->eos_sent = a->eos_done = 0; }   // packets after the end of a stream without a seek: a new stream
     ssize_t i = input_slot(a);
     if (i < 0) { if (!a->red++) LOG("[RED] movie: %s takes no input (first case): a packet is dropped", a->name); return -1; }
     size_t cap = 0; uint8_t *b = AMediaCodec_getInputBuffer(a->c, (size_t)i, &cap);
-    if (!b || c.len > cap) { AMediaCodec_queueInputBuffer(a->c, (size_t)i, 0, 0, 0, 0); if (!a->red++) LOG("[RED] movie: AVC access unit of %zu bytes, the input buffer has %zu", c.len, cap); return -1; }
-    memcpy(b, a->au, c.len);
-    if (AMediaCodec_queueInputBuffer(a->c, (size_t)i, 0, c.len, (uint64_t)(pts_us < 0 ? 0 : pts_us), 0) != AMEDIA_OK) { if (!a->red++) LOG("[RED] movie: AVC packet not queued (first case)"); return -1; }
+    if (!b || len > cap) { AMediaCodec_queueInputBuffer(a->c, (size_t)i, 0, 0, 0, 0); if (!a->red++) LOG("[RED] movie: %s access unit of %zu bytes, the input buffer has %zu", KIND(a), len, cap); return -1; }
+    memcpy(b, src, len);
+    if (AMediaCodec_queueInputBuffer(a->c, (size_t)i, 0, len, (uint64_t)(pts_us < 0 ? 0 : pts_us), 0) != AMEDIA_OK) { if (!a->red++) LOG("[RED] movie: %s packet not queued (first case)", KIND(a)); return -1; }
     if (c.picture) a->pending++;
     drain(a, a->nq ? 0 : 8000);
     for (int k = 0; k < 10 && a->pending > PENDING_MAX && !a->nq; k++) drain(a, 20000);

@@ -19,6 +19,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <stdatomic.h>
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 
 #define R_TIMEOUT     0xEA01u   // Kernel module 1, description 117
 #define R_CANCELLED   0xEC01u   // 118
@@ -305,6 +308,21 @@ static void qos_apply(thr_t *t) {   // on the thread itself, holding G (prio and
 // A host helper thread (audio notify / silent sink, vsync, movie decode) created from a guest thread inherits that thread's class; under DM_QOS_MAP it sets its own instead
 void dm_host_helper_qos(plat_qos_t q) { if (g_qos_map) plat_qos_set_self(q); }
 static const char *thr_name(thr_t *t, char *buf, size_t n);
+// Pointer authentication: Android gives every thread its own address keys (measured on Android 13: each guest thread signed a test value differently), Horizon one set per
+// process. A pointer signed on one guest thread then fails on another (FPAC: SIGILL at the aut instruction): The Legend of Zelda: Ocarina of Time's nn::os fibers sign their entry
+// with IA where they are made and check it on the thread that first runs them (DispatchFiberContext, sdk+0x16d40c). Called on each guest thread before its first guest
+// instruction: with the IA / IB / DA / DB keys off, pac* leave a pointer as it is and aut* check nothing, the same on every thread (pacga's GA key, shared, has no switch).
+// Safe because no host frame below this point signs its return address (only compiler-rt's load-time constructors use paciasp in libnxhost)
+void dm_pac_share(void) {
+#if defined(__linux__) && defined(__aarch64__)
+    uint64_t s = 0x1234560, mod = 0x40000000;
+    int r = prctl(60 /* PR_PAC_SET_ENABLED_KEYS */, 0xf /* IA IB DA DB */, 0, 0, 0);
+    __asm__ volatile(".arch_extension pauth\n pacia %0, %1" : "+r"(s) : "r"(mod));
+    static _Atomic int once;
+    if (r || s != 0x1234560) LOG("[RED] pac: the address keys stay on on this guest thread (prctl %d, errno %d): a pointer signed on another guest thread fails here", r, errno);
+    else if (!atomic_exchange(&once, 1)) LOG("pac: address keys off on the guest threads (Android gives each thread its own, Horizon shares them)");
+#endif
+}
 static void *thread_main(void *p) {
     thr_t *t = p;
     pthread_setspecific(g_keythr, t);
@@ -318,7 +336,8 @@ static void *thread_main(void *p) {
     guest_thread_init(); guest_thread_set_id(t->id);
     guest_gate_stack(1);   // the guest runs on its own stack from dm_thread_enter on: this pthread's stack below this frame is where its SVCs run
     pthread_mutex_lock(&G); while (!t->started) pthread_cond_wait(&t->cv, &G); pthread_mutex_unlock(&G);
-    { char nb[48], hn[64]; snprintf(hn, sizeof hn, "%#x %s", t->handle, thr_name(t, nb, sizeof nb)); plat_thread_set_name(hn); }   // the guest's name (set before StartThread) for sample / Instruments
+    { char nb[48], hn[64]; snprintf(hn, sizeof hn, "%#x %s", t->handle, thr_name(t, nb, sizeof nb)); plat_thread_set_name(hn); }
+    dm_pac_share();   // the guest's name (set before StartThread) for sample / Instruments
     dm_thread_enter(t->entry, t->arg, t->stack_top);   // Does not return: the guest must exit through ExitThread
     die("guest thread entry returned");
 }

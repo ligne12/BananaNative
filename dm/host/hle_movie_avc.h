@@ -5,6 +5,7 @@
 
 typedef struct mavc mavc;
 mavc *mavc_new(void);
+mavc *mavc_new_av1(int w, int h);   // AV1 through the same interface (one temporal unit per mavc_decode; Android's MediaCodec), NULL where the host has no AV1 decoder
 void mavc_free(mavc *a);
 void mavc_param_sets(mavc *a, const uint8_t *p, size_t n);   // SPS / PPS (Configure's csd-0 / csd-1), with or without Annex B start codes
 void mavc_avcc(mavc *a, const uint8_t *p, size_t n);         // SPS / PPS from an AVCDecoderConfigurationRecord (the MP4 avcC box)

@@ -54,6 +54,13 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Fix:** `hle_sf.c` takes over the SDK's HIPC client entry points (`InitializeHipcServiceResolution`, `ConnectToHipcService`, `SendSyncRequest`, `CloseClientSessionHandle` and the control requests `QueryPointerBufferSize`, `ConvertSessionToDomain`, `DuplicateSession(Ex)`): a service it serves (`olsc:u`) gets a host session, and every request on it succeeds with zeroed output, which reads as backup off for every user. Any other name is refused with a red line, as `sm` refuses a service nobody registered (`npns` was never connected). `DM_SF_TRACE=1` dumps each request.
 - **Found on:** [Animal Crossing: New Horizons](../../dm/games/01006F8002326000/README.md) (SDK 20.5.4).
 
+### An async context returned through x8 (`prepo::PlayReport::Send`)
+
+- **Symptom:** `[RED] sf: the game connects to service prepo:u itself, which the host does not serve`, then `nn::diag abort: Result 0xe15` from `prepo::detail::ShimLibraryGlobal::GetSession` under `PlayReportImpl::Send`.
+- **Cause:** SDK 22's `prepo::PlayReport::Send(const account::Uid &)` sends a report and returns an `AsyncContext` (`{IAsyncContext *, Result}`, 16 bytes with a destructor) through x8, the indirect result register; the host hooked only `Save`. A C hook cannot write it: C returns a 16-byte struct in x0 / x1.
+- **Fix:** a two-instruction assembly stub registered in the forced takeover table (`hle_offline.c`) writes an empty context, `{NULL, success}`, through x8. The SDK handles an empty context itself: `GetCompletionEvent` creates and signals an event, `GetResult` returns the stored Result, the destructor releases nothing. The game waits on the event and reads the result as on hardware.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) (SDK 22.2), when its intro movie ends (`main+0x379164c`).
+
 ## SDK names that changed between versions
 
 ### Older SDK names for the same calls

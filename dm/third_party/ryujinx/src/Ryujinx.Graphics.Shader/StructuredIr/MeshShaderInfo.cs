@@ -19,13 +19,23 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
     // The layout (IGpuAccessor.QueryMeshShaderLayout, the job's "mesh"): max vertices, max primitives, payload bytes, the per-vertex plane codes in the order of the
     // planes (the SPH's output map: 0-3 position x y z w, 4 + 4 g + c generic g component c), then optionally -1 and the per-primitive value codes (same numbering,
     // generic only; -3 for a value the program writes that no output takes: the count sets the chunk stride, values x 0x80), then optionally -2 and the generic locations to declare as per-vertex outputs although the program writes none of their components (the
-    // pixel shader reads them: they hold (0, 0, 0, 1))
+    // pixel shader reads them: they hold (0, 0, 0, 1)), then optionally -4 and the output topology when it is not triangles: 1 points (the control section's +0x5f, 3 for
+    // triangles). The point size is plane code 132 (output map byte 0x35 bit 3), its plane before the position's, in attribute address order (0x6c, then 0x70):
+    // The Legend of Zelda: Ocarina of Time's point mesh 2582bd7ea6490d33 stores a depth-scaled scalar at plane 0 and its matrix rows x y z w at planes 1-4,
+    // and one index byte a primitive at 4 + t (a triangle's three at 4 + 3 t)
     class MeshShaderInfo
     {
         public const string PayloadName = "task_payload";
 
         // A per-primitive value no output takes (its stores are dropped)
         public const int NoOutput = -3;
+
+        // The point size's plane code, and the mark before a topology other than triangles
+        public const int PointSizePlane = 4 + 4 * 32;
+        public const int TopologyMark = -4;
+
+        // Point primitives (OutputPoints, one vertex index each) instead of triangles
+        public bool Points { get; }
 
         public bool IsTask { get; }
         public bool IsMesh => !IsTask;
@@ -59,6 +69,19 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
             MaxPrimitives = layout[1];
             PayloadBytes = layout[2];
 
+            int topoSplit = Array.IndexOf(layout, TopologyMark, 3);
+
+            if (topoSplit >= 0)
+            {
+                if (topoSplit != layout.Length - 2 || layout[^1] != 1)
+                {
+                    throw new NotSupportedException($"mesh layout with a topology other than points after {TopologyMark} ({string.Join(", ", layout)})");
+                }
+
+                Points = true;
+                layout = layout[..topoSplit];
+            }
+
             int primSplit = Array.IndexOf(layout, -1, 3);
             int padSplit = Array.IndexOf(layout, -2, 3);
             int end = layout.Length;
@@ -76,7 +99,7 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
                     throw new NotSupportedException($"mesh program with {MaxVertices} vertices / {MaxPrimitives} primitives at most (1-256 each)");
                 }
 
-                if (Planes.Any(p => p < 0 || p >= 4 + 4 * 32) || PrimitivePlanes.Any(p => p != NoOutput && (p < 4 || p >= 4 + 4 * 32)) || PadLocations.Any(g => g < 0 || g >= 32) ||
+                if (Planes.Any(p => (p < 0 || p >= 4 + 4 * 32) && p != PointSizePlane) || PrimitivePlanes.Any(p => p != NoOutput && (p < 4 || p >= 4 + 4 * 32)) || PadLocations.Any(g => g < 0 || g >= 32) ||
                     Planes.Distinct().Count() != Planes.Length || PrimitivePlanes.Where(p => p != NoOutput).Distinct().Count() != PrimitivePlanes.Count(p => p != NoOutput))
                 {
                     throw new NotSupportedException($"mesh layout with a plane code out of range or repeated ({string.Join(", ", layout)})");
@@ -93,7 +116,7 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
             }
 
             PayloadWords = PowerOfTwo(Math.Max(4, (PayloadBytes + 3) / 4));
-            PrimitiveWords = PowerOfTwo(4 + 3 * Math.Max(1, MaxPrimitives));
+            PrimitiveWords = PowerOfTwo(4 + (Points ? 1 : 3) * Math.Max(1, MaxPrimitives));
         }
 
         public static int Chunks(int n)
@@ -108,7 +131,7 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
         public int PlaneWords => PrimitiveBaseWord + Chunks(MaxPrimitives) * PrimitiveChunkWords;
 
         // The generic locations of the per-vertex outputs (the planes' and the padded ones) and of the per-primitive outputs
-        public IEnumerable<int> VertexLocations => Planes.Where(p => p >= 4).Select(p => (p - 4) >> 2).Concat(PadLocations).Distinct().OrderBy(g => g);
+        public IEnumerable<int> VertexLocations => Planes.Where(p => p >= 4 && p != PointSizePlane).Select(p => (p - 4) >> 2).Concat(PadLocations).Distinct().OrderBy(g => g);
         public IEnumerable<int> PrimitiveLocations => PrimitivePlanes.Where(p => p != NoOutput).Select(p => (p - 4) >> 2).Distinct().OrderBy(g => g);
 
         private static int PowerOfTwo(int n)

@@ -586,6 +586,7 @@ namespace Spv
             TaskCountNV = 5274,
             PrimitiveCountNV = 5275,
             PrimitiveIndicesNV = 5276,
+            PrimitivePointIndicesEXT = 5294,
             PrimitiveTriangleIndicesEXT = 5296,
             ClipDistancePerViewNV = 5277,
             CullDistancePerViewNV = 5278,

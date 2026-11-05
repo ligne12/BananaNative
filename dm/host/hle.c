@@ -1,6 +1,7 @@
 // Import resolution (implemented ones go to the host, the rest go to named stubs) and host gate dispatch.
 #include "hle.h"
 #include <dlfcn.h>
+#include <stdatomic.h>
 #include <time.h>
 
 // ---------- Unimplemented imports: named stubs (the statically assembled stub table in entry.S, the k-th = movz x9,#k; b unimpl_entry) ----------
@@ -85,8 +86,29 @@ void stubs_report(void) { LOG("stubs=%u", g_nstub); }
 // The rewriter replaces every svc #n / mrs cntpct with a call to dm_gate; here we remember, by gate block return point (absolute address), what it originally was.
 // Lookup: open-addressing hash, one hit (it used to do module_of + a linear compare over 110 entries on every gate call, keyed by in-module offset, which would collide across modules).
 enum { G_SVC, G_CNTPCT, G_CNTVCT, G_OBS, G_SPIN };
+// OBS_TRACE: temporary diagnostics placed by a profile's patches.py (gate number OBS_TRACE | point << 8), to see whether and how often game code runs: x0-x3, x8, x19-x22 and the
+// return address, the string x1 points to and the first 6 words at x8 (read through dm_guest_read_mapped: unmapped pages read as zeros), on a point's first 8 hits, its hits with a new x0 and its hits that are powers of two
+static void obs_trace(uint64_t *regs, int point) {
+    static _Atomic uint64_t hits[256]; uint64_t n = atomic_fetch_add(&hits[point & 255], 1) + 1;
+    // Also each hit with an x0 not seen at this point before (the first 32 distinct ones): a point hit every frame shows every object it ran on, not only its early hits
+    static _Atomic uint64_t seen[256][32]; int fresh = 0;
+    for (int i = 0; i < 32 && !fresh; i++) {   // (x0 + 1: 0 marks a free slot)
+        uint64_t v = atomic_load(&seen[point & 255][i]);
+        if (!v) { fresh = atomic_compare_exchange_strong(&seen[point & 255][i], &v, regs[0] + 1); if (!fresh && v == regs[0] + 1) break; }   // (v: the other thread's value)
+        else if (v == regs[0] + 1) break;
+    }
+    if (n > 8 && (n & (n - 1)) && !fresh) return;
+    char s[40] = {0}; uint64_t w[6] = {0};
+    if (regs[1] > 0x10000) { dm_guest_read_mapped(s, (uintptr_t)regs[1], sizeof s - 1); for (size_t i = 0; i < sizeof s && s[i]; i++) if (s[i] < 0x20 || s[i] > 0x7e) { s[i] = 0; break; } }
+    if (regs[8] > 0x10000) dm_guest_read_mapped(w, (uintptr_t)regs[8], sizeof w);
+    uint64_t lr = ((const uint64_t *)(uintptr_t)regs[99])[1];   // the game's x30: the gate block pushed it (hle_svc.c guest_caller); regs[30] is the gate's own
+    LOG("[obs] trace point %d hit %llu: x0=%#llx x1=%#llx x2=%#llx x3=%#llx x8=%#llx [x8]=%#llx %#llx %#llx %#llx %#llx %#llx x19=%#llx x20=%#llx x21=%#llx x22=%#llx lr=%#llx x1 \"%s\"",
+        point, (unsigned long long)n, (unsigned long long)regs[0], (unsigned long long)regs[1], (unsigned long long)regs[2], (unsigned long long)regs[3], (unsigned long long)regs[8],
+        (unsigned long long)w[0], (unsigned long long)w[1], (unsigned long long)w[2], (unsigned long long)w[3], (unsigned long long)w[4], (unsigned long long)w[5],
+        (unsigned long long)regs[19], (unsigned long long)regs[20], (unsigned long long)regs[21], (unsigned long long)regs[22], (unsigned long long)lr, s);
+}
 // Observation gates (inserted offline from the rewriter's OBS table): number → read-only callback; with no callback attached the gate returns after one pass in and out
-static void (*g_obs_fn[OBS_MAX])(uint64_t *regs, int param); static int g_obs_have[OBS_MAX];
+static void (*g_obs_fn[OBS_MAX])(uint64_t *regs, int param) = {[OBS_TRACE] = obs_trace}; static int g_obs_have[OBS_MAX];
 void gate_obs_set(int id, void (*fn)(uint64_t *regs, int param)) { if (id <= 0 || id >= OBS_MAX) die("observation gate number out of range %d", id); g_obs_fn[id] = fn; }
 int gate_obs_present(int id) { return id > 0 && id < OBS_MAX && g_obs_have[id]; }
 typedef struct { uint64_t ret; int kind, arg; uint64_t orig; } gate_t;

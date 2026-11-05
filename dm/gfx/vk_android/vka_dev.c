@@ -101,6 +101,9 @@ static int init_once(void) {
     if (x_mesh) dext[ndext++] = VK_EXT_MESH_SHADER_EXTENSION_NAME;
     int x_ph = has_ext(de, nde, "VK_QCOM_queue_perf_hint");
     if (x_ph) dext[ndext++] = "VK_QCOM_queue_perf_hint";
+    // Enabled wherever the device has it: the device is made when the app starts, before the launcher's env file is read, so DM_VK_PSTATS cannot decide it (vka_pso.c pstats)
+    int x_pex = has_ext(de, nde, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+    if (x_pex) dext[ndext++] = VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME;
     free(de);
 
     // Every feature the device has, but robustness and capture-replay (they cost and nothing needs them); the shader side takes what it needs from the same device
@@ -111,10 +114,11 @@ static int init_once(void) {
     VkPhysicalDeviceVertexAttributeDivisorFeatures fdiv = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES};
     VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT fgpl = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT};
     VkPhysicalDeviceMeshShaderFeaturesEXT fmesh = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR fpex = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
     void *chain = placed ? &fmp : NULL;
 #define LINK(on, st) if (on) { (st).pNext = chain; chain = &(st); }
     struct { VkStructureType sType; void *pNext; VkBool32 queuePerfHint; } fph = {(VkStructureType)1000302001};   // VkPhysicalDeviceQueuePerfHintFeaturesQCOM (not in the NDK's headers yet)
-    LINK(x_vin, fvin) LINK(x_rob, frob) LINK(x_i8, fi8) LINK(x_div, fdiv) LINK(x_ph, fph) LINK(x_gpl, fgpl) LINK(x_mesh, fmesh)
+    LINK(x_vin, fvin) LINK(x_rob, frob) LINK(x_i8, fi8) LINK(x_div, fdiv) LINK(x_ph, fph) LINK(x_gpl, fgpl) LINK(x_mesh, fmesh) LINK(x_pex, fpex)
 #undef LINK
     VkPhysicalDeviceVulkan13Features f13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, .pNext = chain};
     VkPhysicalDeviceVulkan12Features f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &f13};
@@ -131,6 +135,7 @@ static int init_once(void) {
     V.divisor = x_div && fdiv.vertexAttributeInstanceRateDivisor; V.logic_op = f2.features.logicOp; V.dual_src = f2.features.dualSrcBlend; V.geom = f2.features.geometryShader;
     V.tess = f2.features.tessellationShader; V.depth_clamp = f2.features.depthClamp; V.fill_lines = f2.features.fillModeNonSolid; V.depth_bias_clamp = f2.features.depthBiasClamp;
     V.multi_vp = f2.features.multiViewport; V.a2c = 1; V.mesh = x_mesh && fmesh.meshShader; V.task = V.mesh && fmesh.taskShader;
+    V.pstats = x_pex && fpex.pipelineExecutableInfo;
     if (!f12.timelineSemaphore || !f13.dynamicRendering) { VRED("the device lacks timeline semaphores (%d) or dynamic rendering (%d)", f12.timelineSemaphore, f13.dynamicRendering); return 0; }
     V.bda = f12.bufferDeviceAddress; V.uab = f12.descriptorBindingSampledImageUpdateAfterBind && f12.descriptorBindingPartiallyBound && f12.runtimeDescriptorArray;
     V.placed = placed && fmp.memoryMapPlaced; V.placed_range = placed && fmp.memoryMapRangePlaced; V.unmap_reserve = placed && fmp.memoryUnmapReserve;

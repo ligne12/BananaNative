@@ -255,7 +255,8 @@ static int same_shape(const vka_img *a, const tex_t *t, const vka_fmt *f, int le
 // the image right from its first use. Meanwhile the texture gets its own image (same_shape), and a view keeps the fallback to the image's own format ([RED]) for the life
 // of an image made before the pair was learned (its views are in use; replacing it would mean rebinding every view and descriptor); so it stays in a run without DM_TEMP,
 // once the table is full (64 pairs) or with 4 formats learned for that image format and size (VL_PER_IMAGE).
-// A pair is taken (learned, or read from the file) only when both formats are uncompressed colour formats (kind 0) of one texel size: a format list may hold only formats
+// A pair is taken (learned, or read from the file) only when both formats are uncompressed colour formats (kind 0 float / unorm / snorm, 1 uint, 2 sint; not depth or stencil)
+// of one texel size, which Vulkan puts in one compatibility class whatever their numeric type: a format list may hold only formats
 // compatible with the image's, and a bad pair in the file (an older build's, a hand edit) would break that rule on every image of its format in every run. The file is
 // written whole (a temporary file renamed over it), so a run that ends while writing leaves the old one. DM_VK_VIEW_LEARN=0: nothing learned or read (views in the image's
 // own format, as before)
@@ -263,11 +264,11 @@ typedef struct { VkFormat a, b; uint32_t w, h; } vlearn;
 enum { NVL = 64 };
 static vlearn g_vl[NVL]; static int g_nvl, g_vl_loaded; static char g_vl_path[1024]; static pthread_mutex_t g_vlmu = PTHREAD_MUTEX_INITIALIZER;
 enum { VL_PER_IMAGE = 4 };   // learned formats one image takes at most (vka_img.xfmt)   // under g_vlmu
-static int vl_bytes(VkFormat v) {   // bytes per texel of an uncompressed colour (kind 0) format of the textures (an image's own format or its sRGB view format), else 0
+static int vl_bytes(VkFormat v) {   // bytes per texel of an uncompressed colour (kind 0-2) format of the textures (an image's own format or its sRGB view format), else 0
     for (int nf = 1; nf < 0x100; nf++) {
         fmt_ent e = fmt_ent_of(nf); int bw = 0, bh = 0, bpb;
         if (e.vk == VK_FORMAT_UNDEFINED || !(e.vk == v || (e.srgb && srgb_twin(e.vk) == v))) continue;
-        return e.kind == 0 && (bpb = nvn_fmt_bpb(nf, &bw, &bh)) && bw == 1 && bh == 1 ? bpb : 0;
+        return e.kind <= 2 && (bpb = nvn_fmt_bpb(nf, &bw, &bh)) && bw == 1 && bh == 1 ? bpb : 0;
     }
     return 0;
 }
@@ -460,7 +461,9 @@ static vka_img *img_create_(const tex_t *t, const vka_fmt *f, uint32_t base, int
     if (ff & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) u |= VK_IMAGE_USAGE_SAMPLED_BIT;
     if ((ff & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) && !compressed(f)) u |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     if (ff & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) u |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-    if ((ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && (d->flags & NVN_TEXTURE_FLAGS_IMAGE) && !f->srgb) u |= VK_IMAGE_USAGE_STORAGE_BIT;
+    // An sRGB texture too: its image is the UNORM format (f->vk), which a shader writes through a UNORM view, and its sRGB views leave storage out (vka_view). The Legend of
+    // Zelda: Ocarina of Time writes its 2560x1440 RGBA8 sRGB output from a compute pass; without storage use the writes went nowhere and the screen stayed black
+    if ((ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && (d->flags & NVN_TEXTURE_FLAGS_IMAGE)) u |= VK_IMAGE_USAGE_STORAGE_BIT;
     // Views in another format: only an 8-bit / BC / ASTC UNORM image as its sRGB twin (NVN sRGB formats are stored as UNORM, and UNORM textures have sRGB views; the
     // only reinterpretation DKB's level makes). A two-entry format list instead of a bare MUTABLE_FORMAT keeps Adreno's UBWC compression on the image; every other image
     // takes views of its own format only
@@ -1660,7 +1663,7 @@ static VkImageView view_of(const treg_ent *e, vka_img *im, int vt_want, int stor
 }
 
 // DM_VK_IMG_UPGRADE=0: no image intent from a binding: made and kept without storage use, the binding reads as unbound (as before); live
-static int storage_able(const vka_img *im) { return !im->no_storage && !im->rs && VKA_ENV("DM_VK_IMG_UPGRADE", 1) && im->aspect == VK_IMAGE_ASPECT_COLOR_BIT && !im->f.srgb && (feats(im->f.vk) & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT); }
+static int storage_able(const vka_img *im) { return !im->no_storage && !im->rs && VKA_ENV("DM_VK_IMG_UPGRADE", 1) && im->aspect == VK_IMAGE_ASPECT_COLOR_BIT && (feats(im->f.vk) & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT); }   // (sRGB too: img_create)
 // A texture made without NVN's IMAGE flag and then bound to a shader image slot (nvn_mtl.m image_prepare: the binding is the image intent; some engines register a texture with
 // RegisterTexture and use its handle in an image slot). Its image was made without storage use (img_create), so the shader's writes went nowhere and what read the texture
 // afterwards saw what was there before: DKB's opening area drew purple (a compute pass writing a 1536x864 R11G11B10 target). The image is remade with storage use, its content
@@ -1817,7 +1820,7 @@ vka_img *vka_tex_id_img(int id, VkCommandBuffer cb) {   // the image of texture 
     nvn_pool_use(1); vka_img *im = treg_dead(id, &e) ? NULL : vka_tex_get(&e.t, cb); nvn_pool_use(0);
     return im;
 }
-// DM_VK_NANSCAN_DUMP: level 0 of texture ID id as its storage holds it now (deswizzled), written to DM_TEMP as nan-now-<serial>.blk
+// DM_VK_NANSCAN_DUMP and DM_VK_TEXDUMP: level 0 of texture ID id as its storage holds it now (deswizzled), written to DM_TEMP as nan-now-<serial>.blk
 void vka_tex_id_dump(int id) {
     pthread_mutex_lock(&g_tmu);
     if (id <= 0 || id >= g_ntreg || !g_treg[id].t.serial) { pthread_mutex_unlock(&g_tmu); return; }
