@@ -30,8 +30,38 @@ static int g_origin_ll = 1, g_queue_origin_ll = 1, g_depth_zero;
 _Atomic int vka_synclog_n;   // DM_VK_SYNCLOG: lines left (mtl_wait)
 #define g_synclog vka_synclog_n
 static double ms_now(void) { return (now_ns() % 1000000000000ull) / 1e6; }
-#define RC_PEND 64
-static uint64_t g_rc_ts[RC_PEND]; static int g_nrc_ts;   // timestamp reports replayed in this submission (their counter field reads 0 once written)
+// Conditional rendering (profile render_cond) is evaluated at replay, on the CPU, from the records in memory (rc_known; nxnative nvn_mtl.m rc_value). A report replayed
+// earlier in this submission is not written yet (the completion writes it): a timestamp one counts with its counter 0 (g_rc_ts, this submission's); an address any other
+// report ever wrote (samples passed: an occlusion query) is unknown at replay, and a condition on it keeps drawing, as occlusion culling only saves work. Neither table drops
+// an entry. Read from memory instead, a query pair held the 1 / 1 the completion writes for samples passed, or what was there before it, so RENDER_IF_NOT_EQUAL skipped a
+// draw or not depending on when its submission had completed: Ocarina of Time's objects lost their colour pass at random, frame to frame, for about 20 s after a save loaded
+// (their depth drawn, the HDR target's bright fill left: white silhouettes). The timestamp table held 64 a submission and forgot the rest (the Mac's Splatoon Raiders fault)
+static uint64_t *g_rc_ts; static int g_nrc_ts, g_rc_tcap;
+static uint64_t *g_rc_occ; static uint32_t g_rc_ocap, g_rc_on;   // open addressing, a power of two
+static int rc_occ_has(uint64_t a) {
+    if (!g_rc_ocap) return 0;
+    for (uint32_t i = (uint32_t)(a >> 4) & (g_rc_ocap - 1);; i = (i + 1) & (g_rc_ocap - 1)) { if (g_rc_occ[i] == a) return 1; if (!g_rc_occ[i]) return 0; }
+}
+static void rc_occ_add(uint64_t a) {
+    if (!a || rc_occ_has(a)) return;
+    if ((g_rc_on + 1) * 2 > g_rc_ocap) {
+        uint32_t oc = g_rc_ocap, nc = oc ? oc * 2 : 4096; uint64_t *old = g_rc_occ, *t = calloc(nc, 8);
+        if (!t) { VRED_ONCE("conditional rendering: no memory for the query report table: conditions on later queries read memory"); return; }
+        for (uint32_t k = 0; k < oc; k++) if (old[k]) { uint32_t i = (uint32_t)(old[k] >> 4) & (nc - 1); while (t[i]) i = (i + 1) & (nc - 1); t[i] = old[k]; }
+        g_rc_occ = t; g_rc_ocap = nc; free(old);
+    }
+    uint32_t i = (uint32_t)(a >> 4) & (g_rc_ocap - 1); while (g_rc_occ[i]) i = (i + 1) & (g_rc_ocap - 1);
+    g_rc_occ[i] = a; g_rc_on++;
+}
+static void rc_ts_add(uint64_t a) {
+    for (int i = 0; i < g_nrc_ts; i++) if (g_rc_ts[i] == a) return;
+    if (g_nrc_ts == g_rc_tcap) {
+        int nc = g_rc_tcap ? g_rc_tcap * 2 : 256; uint64_t *t = realloc(g_rc_ts, (size_t)nc * 8);
+        if (!t) { VRED_ONCE("conditional rendering: no memory for the timestamp report table: conditions on later timestamps read memory"); return; }
+        g_rc_ts = t; g_rc_tcap = nc;
+    }
+    g_rc_ts[g_nrc_ts++] = a;
+}
 
 int vka_origin_ll(void) { return __atomic_load_n(&g_origin_ll, __ATOMIC_RELAXED); }
 int vka_queue_origin_ll(void) { return g_queue_origin_ll; }
@@ -678,7 +708,8 @@ static void not_yet(uint32_t op) {
     g_stat_skipped++;
     VRED_ONCE("DrawTexture (op %u) is not on Vulkan yet: skipped from now on", op);
 }
-static int rc_known(uint64_t a, uint64_t *v) {   // a counter at a: 0 for a timestamp report earlier in this submission, else what memory holds now (0 = unknown)
+static int rc_known(uint64_t a, uint64_t *v) {   // a counter at a: unknown for a query's, 0 for a timestamp report earlier in this submission, else what memory holds now (0 = unknown)
+    if (rc_occ_has(a)) { static _Atomic int n; if (!atomic_fetch_add(&n, 1)) VLOG("conditional rendering: a condition on a query's result (%#llx) keeps drawing", (unsigned long long)a); return 0; }
     for (int i = 0; i < g_nrc_ts; i++) if (g_rc_ts[i] == a) { *v = 0; return 1; }
     if (!vka_addr(a, 8, NULL, NULL, NULL)) return 0;
     memcpy(v, (const void *)(uintptr_t)a, 8); return 1;
@@ -713,7 +744,7 @@ static void exec(const uint8_t *p, int depth) {
                 if (!vka_enc_call(seg_write, &w, sizeof w)) seg_write(&w);
             }
             post((pop){2, 0, q, (uint32_t)t, ad});
-            if ((t == NVN_COUNTER_TYPE_TIMESTAMP || t == NVN_COUNTER_TYPE_TIMESTAMP_TOP) && DM_GAME_RENDER_COND && g_nrc_ts < RC_PEND) g_rc_ts[g_nrc_ts++] = ad;
+            if (DM_GAME_RENDER_COND) { if (t == NVN_COUNTER_TYPE_TIMESTAMP || t == NVN_COUNTER_TYPE_TIMESTAMP_TOP) rc_ts_add(ad); else rc_occ_add(ad); }
             if (atomic_load_explicit(&g_synclog, memory_order_relaxed) > 0) VLOG("sync report: frame %llu type %llu at draw %llu of the submission, part %d, recording at %.2f ms", (unsigned long long)g_frame,
                                                                            (unsigned long long)t, (unsigned long long)(g_stat_draws - g_sub_draws0), g_nx + 1, ms_now());
             break; }

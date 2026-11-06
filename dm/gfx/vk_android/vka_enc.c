@@ -441,7 +441,7 @@ void vka_enc_sync(void) {
 void vka_enc_start(VkCommandBuffer cb) {
     vka_enc_sync();
     extern int vka_gp_active;
-    if (!VKA_ENV("DM_VK_ENC", 1) || vka_gp_active || vka_nan_on() || !up()) { atomic_store(&g_ecb, VK_NULL_HANDLE); return; }
+    if (!VKA_ENV("DM_VK_ENC", 1) || vka_gp_active || vka_nan_on() || vka_rtdump_on() || !up()) { atomic_store(&g_ecb, VK_NULL_HANDLE); return; }
     { int bt = VKA_ENV("DM_VK_ENC_BATCH", 4096); g_batch = bt < 0 ? 0 : bt > (1 << 20) ? (1 << 20) : (uint32_t)bt; }   // live: from this submission
     atomic_store(&g_ecb, cb);
 }

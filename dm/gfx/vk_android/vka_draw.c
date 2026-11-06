@@ -184,6 +184,7 @@ void vka_rp_end(void) {
     vka_barrier(g_cb);   // the pass's writes before whatever reads them next (copies, the present, the next pass's samples)
     R.on = 0; vka_tex_feedback(NULL, NULL, 0);
     if (vka_nan_on()) vka_nan_pass(g_cb, R.cim, R.clv, R.cl0, R.nci);
+    if (vka_rtdump_on()) vka_rtdump_pass(g_cb, R.cim, R.clv, R.cl0, R.nci);   // DM_VK_RTDUMP
 }
 static void rt_range(const vka_img *im, const view_t *v, int has_v, uint32_t *lv, uint32_t *l0, uint32_t *nl) {
     *lv = has_v && v->set_levels ? v->base_level : 0;
@@ -1394,6 +1395,7 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
     if (!p) { g_skipped++; return; }
     if (!DY.valid || !g_dyn_filter || DY.pipe != p) { vk.vkCmdBindPipeline(g_cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p); DY.pipe = p; VB.vin_stale = 1; }
     if (vka_nan_on()) vka_nan_draw(mesh ? sh[7]->key : sh[0]->key, fs ? fs->key : 0);
+    if (vka_rtdump_on()) vka_rtdump_draw(mesh ? sh[7]->key : sh[0]->key, fs ? fs->key : 0);
     PT(5);
     if (!bind_sets(d, sh, &lay, VK_PIPELINE_BIND_POINT_GRAPHICS, NULL)) { g_skipped++; return; }
     if (g_kd_last) {   // DM_VK_KEYDUMP: the draw's parameters, and with DM_VK_KEYDUMP_FULL its indices

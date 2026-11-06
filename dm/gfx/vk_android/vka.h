@@ -437,6 +437,9 @@ void vka_nan_pass(VkCommandBuffer cb, vka_img *const *ims, const uint32_t *lvs, 
 void vka_nan_commit(uint64_t fence);
 void vka_draw_stats(uint64_t *draws, uint64_t *skipped, uint64_t *dispatches, uint64_t *pipelines);
 
+int vka_rtdump_on(void);                            // DM_VK_RTDUMP: the colour targets of every pass of the next n frames, as thumbnails (vka_rtdump.c)
+void vka_rtdump_draw(uint64_t vs, uint64_t fs);
+void vka_rtdump_pass(VkCommandBuffer cb, vka_img *const *ims, const uint32_t *lvs, const uint32_t *l0s, int n);
 // ---------- Present (vka_present.c) ----------
 int vka_origin_ll(void);
 int vka_queue_origin_ll(void);   // the submitting queue's raster origin (nvnQueueBuilder flags): the winding flips with it
