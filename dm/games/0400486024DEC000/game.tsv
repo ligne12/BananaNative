@@ -38,6 +38,10 @@ sys_resource	0x3000000
 # ---- Graphics ----
 # agl's render buffer binding wraps its clears in render conditions in Donkey Kong Bananza and Tears of the Kingdom (the same engine): on until this game shows otherwise
 render_cond	on
+# As Tears of the Kingdom and on the Mac host (nxnative's profile of this game): the CPU writes the terrain tiles' height (R32F), blend and hole (RGBA8) maps into textures
+# after creating them. Without the keys they stay zero: black holes in the ground around Kokiri Forest's paths with leaves floating in them, unlit trunks
+tex_flush_upload	on
+tex_dirty_upload	on
 
 # ---- Shader split (shader_split.py) ----
 shader_groups	/Shader/ApplicationPackage=layout /Shader/=shader /Effect/=effect /UI/=layout

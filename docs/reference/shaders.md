@@ -591,6 +591,21 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Fix:** general: `RemoveNode` follows only into producers without side effects (`HasSideEffects`). This follows MacNativeGames' translator patch 0002.
 - **Found on:** no game on hand so far. Rebuilding the chain changed no shader for this reason in Tears of the Kingdom, Breath of the Wild, Wonder, Scarlet or ANIMAL WELL (94,717 shaders); every MSL change was the early fragment tests attribute.
 
+### Dead-code removal dropped a coordinate of a multi-output instruction
+
+- **Symptom:** a simulation or filter that reads neighbouring texels misbehaves though every constant is right: a coordinate is a variable declared with no value. On Ocarina of Time, grass whose blades shift at 10 Hz.
+- **Cause:** the same walk as the entry above. `RemoveNode` also followed a producer with another destination still in use: an image read with a dead `.x` and a live `.y` stays in the block, but its coordinates lost their use, and the next pass deleted the chain computing them, so the read took an undefined coordinate (Ocarina of Time's divergence step `04942f42cae10d0f` read its `y - 1` neighbour at a garbage row, and the wind's pressure solve never settled).
+- **Fix:** general: `Optimizer.cs` `RemoveNode` follows only a producer all of whose destinations are unused (`DestHasNoUses`). A chain change. From the Mac host's fork (nxnative `b1d7c707`), where it was found.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md): 8 of its 42,845 shaders on the Mac, among them the wind solver and two NDSR upscaler variants.
+
+### Float atomics in storage memory
+
+- **Symptom:** a Switch 2 game's picture is far too bright wherever the view opens out: lifted blacks, a pale veil (on Android the whole of Kokiri Forest under a white haze). The build log has `Invalid reduction type: F32FtzRn`, easy to miss among thousands of lines.
+- **Cause:** `RED.F32.FTZ.RN` (an atomic float add to a word of memory) was dropped with that log line. agl's scene analysis sums luminance this way (`probe_analyze` `6e28359aa3558f61` and its siblings), and the CPU reads those buffers back into the exposure: the sums stayed 0, so the game applied its full correction.
+- **Fix:** `InstEmitMemory.cs` `EmitAtomicAddF32`: a compare-and-swap loop on the word, in `EmitAtomicOp`, so ATOM's float form and the Ampere RED / ATOM emitters get it too. The chain's SPIR-V has no float atomic add (and Metal's buffer atomics none in the form the Mac chain uses). A chain change. From the Mac host's fork (nxnative `b1d7c707`), where it was found.
+- **Check:** the full Android build of Ocarina of Time (42,331 shaders, chain `9d178638884a`) logs no `Invalid reduction type`; `6e28359aa3558f61`'s module has its `OpAtomicCompareExchange` loops and validates.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md): on the AYN Thor the house went from washed out to dark with the window's light, Kokiri Forest got its contrast back, and the GPU time in the house fell from about 26 to 16 ms a frame (2026-11-06).
+
 ### Position invariance across shaders
 
 - **Symptom:** the ground kept stale 32×32 blocks where the G-buffer draw failed the depth test: blocks of a stale image where a depth pre-pass and a later pass with other vertex shaders meet (Odyssey: 32×32 blocks on every fourth frame).
