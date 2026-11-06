@@ -1106,6 +1106,36 @@ static int memu_rb_buf(void) {
     }
     g_memu_rb.map = p; return 1;
 }
+// DM_VK_MESH_EMU_PEEK=<mesh key>[,<mesh key>] (live: an env line of ctl.txt arms it again): the next emulated draw of each of those mesh shaders has the first 256 words
+// of its first two mesh workgroups' planes read back from the GPU and logged 32 a line as floats (plane n of vertex v < 32 is word n x 32 + v), to compare what two
+// mesh programs hand one pixel shader
+static struct { VkBuffer buf; VkDeviceMemory mem; float *map; uint64_t frame[2], key[2], want[2]; uint32_t gen; } g_mpk = {.gen = ~0u};
+static int mpk_buf(void) {
+    if (g_mpk.buf) return 1;
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 2 * 2048, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    if (vk.vkCreateBuffer(V.dev, &bi, NULL, &g_mpk.buf)) { g_mpk.buf = VK_NULL_HANDLE; return 0; }
+    VkMemoryRequirements mr; vk.vkGetBufferMemoryRequirements(V.dev, g_mpk.buf, &mr);
+    uint32_t t = vka_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = t};
+    void *p = NULL;
+    if (t == UINT32_MAX || vk.vkAllocateMemory(V.dev, &ai, NULL, &g_mpk.mem) || vk.vkBindBufferMemory(V.dev, g_mpk.buf, g_mpk.mem, 0) || vk.vkMapMemory(V.dev, g_mpk.mem, 0, VK_WHOLE_SIZE, 0, &p)) {
+        if (g_mpk.mem) vk.vkFreeMemory(V.dev, g_mpk.mem, NULL);
+        vk.vkDestroyBuffer(V.dev, g_mpk.buf, NULL); g_mpk.buf = VK_NULL_HANDLE; g_mpk.mem = VK_NULL_HANDLE; return 0;
+    }
+    g_mpk.map = p; return 1;
+}
+static void mpk_drain(void) {
+    uint64_t vka_frame(void);
+    for (int i = 0; i < 2; i++) {
+        if (!g_mpk.frame[i] || g_mpk.frame[i] + 8 > vka_frame()) continue;   // (its submission done by then, as memu_rb_drain)
+        for (int l = 0; l < 16; l++) {
+            const float *f = g_mpk.map + 512 * i + 32 * l; char b[640]; size_t o = 0;
+            for (int k = 0; k < 32 && o < sizeof b; k++) o += (size_t)snprintf(b + o, sizeof b - o, " %.4g", f[k]);
+            VLOG("mesh emulation peek (frame %llu, mesh %016llx) workgroup %d words %d-%d:%s", (unsigned long long)g_mpk.frame[i], (unsigned long long)g_mpk.key[i], l / 8, 32 * (l % 8), 32 * (l % 8) + 31, b);
+        }
+        g_mpk.frame[i] = 0;
+    }
+}
 
 // The dispatches of one emulated mesh draw (sh[6] task or NULL, sh[7] mesh): 0 when it cannot be drawn (logged)
 static int memu_run(vka_dstate *d, const p_draw *dw, vka_shader *const sh[VKA_NSTAGE]) {
@@ -1153,6 +1183,23 @@ static int memu_run(vka_dstate *d, const p_draw *dw, vka_shader *const sh[VKA_NS
         vka_barrier(g_cb);
         g_dispatches++;
     }
+    {   // DM_VK_MESH_EMU_PEEK
+        uint32_t g = atomic_load(&vka_env_gen);
+        if (g != g_mpk.gen) {
+            g_mpk.gen = g; g_mpk.want[0] = g_mpk.want[1] = 0; int n = 0;
+            for (const char *e = getenv("DM_VK_MESH_EMU_PEEK"); e && *e && n < 2;) { char *x; uint64_t k = strtoull(e, &x, 16); if (x == e) break; g_mpk.want[n++] = k; e = *x == ',' ? x + 1 : x; }
+        }
+        if (g_mpk.buf) mpk_drain();
+        for (int i = 0; i < 2; i++) if (g_mpk.want[i] == sh[7]->key && !g_mpk.frame[i] && cap >= 2 && mpk_buf()) {
+            g_mpk.want[i] = 0;   // once per arming
+            VkBufferCopy c[2] = {{4 * (VkDeviceSize)pl, 2048 * (VkDeviceSize)i, 1024}, {4 * ((VkDeviceSize)pl + planes), 2048 * (VkDeviceSize)i + 1024, 1024}};
+            vk.vkCmdCopyBuffer(g_cb, g_memu.buf, g_mpk.buf, 2, c);
+            VkMemoryBarrier hb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
+            vk.vkCmdPipelineBarrier(g_cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hb, 0, NULL, 0, NULL);
+            vka_barrier(g_cb);
+            uint64_t vka_frame(void); g_mpk.frame[i] = vka_frame(); g_mpk.key[i] = sh[7]->key;
+        }
+    }
     int lg = VKA_ENV("DM_VK_MESH_EMU_LOG", 0);
     if (lg != g_memu_log_gen) { g_memu_log_gen = lg; g_memu_logged = 0; }
     if (g_memu_rb.buf) memu_rb_drain(0);
@@ -1160,8 +1207,9 @@ static int memu_run(vka_dstate *d, const p_draw *dw, vka_shader *const sh[VKA_NS
         uint64_t vka_frame(void);
         int slot = g_memu_rb_n++ % 64;
         if (g_memu_rb_frame[slot]) memu_rb_drain(1);   // (the ring went round before its frames were done: what it holds, as it is)
-        VLOG("mesh emulation draw %d: task %016llx mesh %016llx, %s %d (first %d), capacity %llu, plane words %llu, max primitives %llu, payload words %llu%s",
-             g_memu_logged, sh[6] ? (unsigned long long)sh[6]->key : 0ull, (unsigned long long)sh[7]->key, dw->ind ? "indirect at" : "count", dw->ind ? 0 : dw->count, dw->first,
+        VLOG("mesh emulation draw %d: task %016llx mesh %016llx pixel %016llx, %s %d (first %d), capacity %llu, plane words %llu, max primitives %llu, payload words %llu%s",
+             g_memu_logged, sh[6] ? (unsigned long long)sh[6]->key : 0ull, (unsigned long long)sh[7]->key, sh[1] ? (unsigned long long)sh[1]->key : 0ull,
+             dw->ind ? "indirect at" : "count", dw->ind ? 0 : dw->count, dw->first,
              (unsigned long long)cap, (unsigned long long)planes, (unsigned long long)maxp, (unsigned long long)pw, dw->ind ? " (arguments read by the GPU)" : "");
         VkBufferCopy c = {0, 64 * (VkDeviceSize)slot, 64};
         vk.vkCmdCopyBuffer(g_cb, g_memu.buf, g_memu_rb.buf, 1, &c);

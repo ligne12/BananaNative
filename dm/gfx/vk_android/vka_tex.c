@@ -1612,6 +1612,15 @@ void vka_img_written_at(vka_img *im, const char *file, int line) {
 void vka_tex_writeback(VkCommandBuffer cb) {
     pthread_mutex_lock(&g_tmu);
     int any = 0;
+// DM_VK_WB_LOG=<n> (live; each new value starts the count again): for the next n copies back of a linear texture of at most 16 bytes, its storage's words once the GPU is
+// done (frame, serial, as floats and as hex): what the CPU reads back (agl's 1x1 RGBA32F exposure targets in Ocarina of Time)
+typedef struct { uint64_t serial, frame; const uint8_t *mem; uint32_t n; } wb_peek;
+static void wb_peek_log(void *arg) {
+    wb_peek *p = arg; uint32_t w[4] = {0}; float f[4]; memcpy(w, p->mem, p->n); memcpy(f, w, sizeof f);
+    VLOG("linear texture serial %llu, frame %llu, its storage after the copy back: %g %g %g %g (%08x %08x %08x %08x)", (unsigned long long)p->serial, (unsigned long long)p->frame,
+         p->n > 0 ? f[0] : 0.0, p->n > 4 ? f[1] : 0.0, p->n > 8 ? f[2] : 0.0, p->n > 12 ? f[3] : 0.0, w[0], w[1], w[2], w[3]);
+    free(p);
+}
     for (int i = 0; i < g_nwb; i++) {
         vka_img *im = g_wb[i]; im->wb_pending = 0;
         uint32_t bpb = im->f.bpb, h = im->h; size_t row = im->d.stride ? im->d.stride : (size_t)im->w * bpb;
@@ -1641,6 +1650,15 @@ void mtl_tex_cpu_written(const tex_t *t) {
     smap_ent *e = map_get(t->serial);
     if (!e) cpuw_take(t->serial, 1);
     else if (e->im && !e->im->gpu_owned && !e->im->cpu_dirty) {
+        {   // DM_VK_WB_LOG
+            static int last; static _Atomic int left; int want = VKA_ENV("DM_VK_WB_LOG", 0);
+            if (want != last) { last = want; atomic_store(&left, want); }
+            size_t sz = (size_t)row * (h - 1) + (size_t)im->w * bpb;
+            if (sz <= 16 && atomic_load(&left) > 0 && atomic_fetch_sub(&left, 1) > 0) {
+                wb_peek *p = malloc(sizeof *p);
+                if (p) { *p = (wb_peek){im->serial, vka_frame(), (const uint8_t *)im->mem, (uint32_t)sz}; vka_after(vka_fence_last() + 1, wb_peek_log, p); }
+            }
+        }
         e->im->cpu_dirty = 1;
         if (g_nredo == g_redocap) { g_redocap = g_redocap ? g_redocap * 2 : 64; g_redo = realloc(g_redo, (size_t)g_redocap * sizeof *g_redo); }
         g_redo[g_nredo++] = t->serial;
@@ -2242,7 +2260,9 @@ void vka_tex_prepare(VkCommandBuffer cb) {
             w[nw] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g_set, .dstBinding = 0, .dstArrayElement = (uint32_t)id, .descriptorCount = 1,
                                         .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, .pImageInfo = &ii[nw]};
         } else write_tex(id, cb, &w[nw], &ii[nw]);
-        if (w[nw].pImageInfo->imageView) nw++;
+        // g_null_view is never made: a slot left unwritten would keep the image last written there, the previous texture at that ID or one destroyed since (a deferred
+        // ID re-registered after a scene change). With null descriptors the null view is written, and reads give zero
+        if (w[nw].pImageInfo->imageView || V.null_desc) nw++;
         if (nw == BATCH) { vk.vkUpdateDescriptorSets(V.dev, (uint32_t)nw, w, 0, NULL); nw = 0; }
     }
     g_ntd = 0;
