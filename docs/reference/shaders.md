@@ -606,6 +606,14 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Check:** the full Android build of Ocarina of Time (42,331 shaders, chain `9d178638884a`) logs no `Invalid reduction type`; `6e28359aa3558f61`'s module has its `OpAtomicCompareExchange` loops and validates.
 - **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md): on the AYN Thor the house went from washed out to dark with the window's light, Kokiri Forest got its contrast back, and the GPU time in the house fell from about 26 to 16 ms a frame (2026-11-06).
 
+### F2IP's rounding modes
+
+- **Symptom:** foliage drawn by mesh programs is pure white with a bloom halo, steady from frame to frame, while the rest of the scene is lit; the log has `[RED] vk: shader <key> (program stage 1) is not in the shader library` for mesh shaders, and the build failed them with `F2IP modifiers 0xc4, c R255`.
+- **Cause:** `F2IP` (base `0x043`, two floats to bytes) rounds as F2I does, by bits 78..79 (`RoundMode2`). The translator took only modifiers `0x4` (round to nearest) and refused the truncating form `0xc4`. The mesh programs of a draw's colour pass failed while the depth pass's (another mesh shader, depth and alpha test only) built, so the leaves had depth but no G-buffer colour and the lighting read what that buffer held.
+- **Fix:** `InstEmitAmpereAlu.cs` `AF2ip` rounds by bits 78..79 (nearest, floor, ceiling, truncation) before the clamp to 0..255, as nxnative's `b1d7c707`. Bits 72..77 other than 4, bits 80 on, and a register in c still fail the shader. A chain change.
+- **Check:** the full Android build of Ocarina of Time (42,380 shaders, chain `5a7307ea90fe`) translates `ecead5cd0569091f`, `604134a5262ff670` and `fed302d791a4ba43`; the replay logs no shader missing from the library in Link's house.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md): the leaves in Link's house, white since the mesh programs drew (2026-11-06); with `DM_VK_DRAW_SKIP` the white came from the depth pass's mesh shader `d98076e4148db34f`, whose pixel shader `31939e82a58a9fbc` it shares with a shadow pass.
+
 ### Position invariance across shaders
 
 - **Symptom:** the ground kept stale 32×32 blocks where the G-buffer draw failed the depth test: blocks of a stale image where a depth pre-pass and a later pass with other vertex shaders meet (Odyssey: 32×32 blocks on every fourth frame).
