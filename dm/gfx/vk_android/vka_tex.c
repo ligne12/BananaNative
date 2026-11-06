@@ -1827,7 +1827,9 @@ void vka_tex_id_dump(int id) {
     treg_ent e = g_treg[id];
     pthread_mutex_unlock(&g_tmu);
     vka_fmt f; if (!e.t.mem || !vka_fmt_of(e.t.d.format, &f)) return;
-    uint32_t bx = (e.t.d.width + f.bw - 1) / f.bw, by = (e.t.d.height + f.bh - 1) / f.bh; size_t pitch = (size_t)bx * f.bpb, n = pitch * by;
+    // A 3D texture is written slice after slice (nvn_deswizzle: slices x rows x pitch); the buffer held one slice, and Ocarina of Time's 128x72x96 fog volume overran it
+    uint32_t bx = (e.t.d.width + f.bw - 1) / f.bw, by = (e.t.d.height + f.bh - 1) / f.bh, slices = e.t.d.target == 2 && e.t.d.depth ? e.t.d.depth : 1;
+    size_t pitch = (size_t)bx * f.bpb, n = pitch * by * slices;
     uint8_t *buf = malloc(n); if (!buf) return;
     nvn_pool_use(1); int bad = treg_dead(id, &e) || (e.t.pool && !nvn_pool_live(e.t.pool, NULL, NULL)) || nvn_deswizzle(&e.t.d, 0, 0, e.t.mem, buf, pitch); nvn_pool_use(0);   // (a finalized pool's storage is not read)
     if (!bad) {

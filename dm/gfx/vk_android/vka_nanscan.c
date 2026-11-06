@@ -152,22 +152,24 @@ int vka_nan_probe(uint64_t fs) {
     if (nin[i] >= 4) return 0;
     nin[i]++; g_cur = fs; return 1;
 }
-// DM_VK_NANSCAN_GPUDUMP=1 (with DM_VK_NANSCAN=2 and DM_VK_NANSCAN_FS): the probed draw's sampled colour textures as the GPU holds them before it (level 0, layer 0, uncompressed
+// DM_VK_NANSCAN_GPUDUMP=<n> (live; with DM_VK_NANSCAN=2 and DM_VK_NANSCAN_FS): the probed draw's sampled colour textures as the GPU holds them before it (level 0, layer 0 or a 3D texture's every slice, uncompressed
 // formats), each copied into a host-visible buffer of its own and written to DM_TEMP as gpu-<fragment key>-s<serial>-f<frame>-<w>x<h>-vk<VkFormat>.blk (rows packed)
 // once the submission is done: what a render target the GPU drew holds, which vka_tex_id_dump (guest storage) cannot show. The first 3 frames of each key, 48 files at most
-typedef struct { VkBuffer buf; VkDeviceMemory mem; void *map; uint64_t key, serial, frame; uint32_t w, h, vkf; int after; VkDeviceSize n; } gdump_t;
+typedef struct { VkBuffer buf; VkDeviceMemory mem; void *map; uint64_t key, serial, frame; uint32_t w, h, d, vkf; int after; VkDeviceSize n; } gdump_t;
 static gdump_t *g_gd[64]; static int g_ngd, g_after;
 static void gdump_write(void *arg) {   // the completion thread, after the submission's fence
     gdump_t *g = arg; char fn[512];
-    snprintf(fn, sizeof fn, "%s/gpu-%016llx-%s-s%llu-f%llu-%ux%u-vk%u.blk", getenv("DM_TEMP") ? getenv("DM_TEMP") : "/data/local/tmp", (unsigned long long)g->key,
-             g->after ? "after" : "in", (unsigned long long)g->serial, (unsigned long long)g->frame, g->w, g->h, g->vkf);
+    snprintf(fn, sizeof fn, "%s/gpu-%016llx-%s-s%llu-f%llu-%ux%ux%u-vk%u.blk", getenv("DM_TEMP") ? getenv("DM_TEMP") : "/data/local/tmp", (unsigned long long)g->key,
+             g->after ? "after" : "in", (unsigned long long)g->serial, (unsigned long long)g->frame, g->w, g->h, g->d, g->vkf);
     FILE *f = fopen(fn, "wb"); if (f) { fwrite(g->map, 1, (size_t)g->n, f); fclose(f); }
-    VLOG("NaN scan: GPU content of serial %llu (%ux%u VkFormat %u, %s a draw of %016llx, frame %llu) %s %s", (unsigned long long)g->serial, g->w, g->h, g->vkf,
+    VLOG("NaN scan: GPU content of serial %llu (%ux%ux%u VkFormat %u, %s a draw of %016llx, frame %llu) %s %s", (unsigned long long)g->serial, g->w, g->h, g->d, g->vkf,
          g->after ? "target, after" : "input, before", (unsigned long long)g->key, (unsigned long long)g->frame, f ? "written to" : "could not be written to", fn);
     vk.vkUnmapMemory(V.dev, g->mem); vk.vkDestroyBuffer(V.dev, g->buf, NULL); vk.vkFreeMemory(V.dev, g->mem, NULL); free(g);
 }
 static void gdump_record(VkCommandBuffer cb, vka_img *const *ims, int n) {
-    static _Atomic int total; static uint64_t keys[NPROBE], kf[NPROBE]; static int frames[NPROBE];
+    static _Atomic int total; static uint64_t keys[NPROBE], kf[NPROBE]; static int frames[NPROBE], armed;
+    int arm = vka_nan_gpudump();
+    if (arm != armed) { armed = arm; atomic_store(&total, 0); memset(keys, 0, sizeof keys); memset(kf, 0, sizeof kf); memset(frames, 0, sizeof frames); }
     int ki = 0; while (ki < NPROBE && keys[ki] && keys[ki] != g_cur) ki++;
     if (ki == NPROBE) return;
     if (!keys[ki]) keys[ki] = g_cur;
@@ -176,7 +178,8 @@ static void gdump_record(VkCommandBuffer cb, vka_img *const *ims, int n) {
     for (int i = 0; i < n && g_ngd < 64; i++) {
         vka_img *im = ims[i];
         if (!im || !im->inited || im->samples != 1 || im->aspect != VK_IMAGE_ASPECT_COLOR_BIT || im->f.bw != 1 || im->f.bh != 1 || !im->f.bpb) continue;
-        VkDeviceSize sz = (VkDeviceSize)im->w * im->h * im->f.bpb; if (!sz || sz > (64u << 20) || atomic_fetch_add(&total, 1) >= 48) continue;
+        uint32_t d = im->d.target == NVN_TEXTURE_TARGET_3D && im->depth > 1 ? im->depth : 1;   // a 3D texture whole (Ocarina of Time's fog volume, 128x72x96)
+        VkDeviceSize sz = (VkDeviceSize)im->w * im->h * d * im->f.bpb; if (!sz || sz > (64u << 20) || atomic_fetch_add(&total, 1) >= 48) continue;
         gdump_t *g = calloc(1, sizeof *g); if (!g) continue;
         VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = sz, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
         if (vk.vkCreateBuffer(V.dev, &bi, NULL, &g->buf)) { free(g); continue; }
@@ -188,9 +191,9 @@ static void gdump_record(VkCommandBuffer cb, vka_img *const *ims, int n) {
             vk.vkDestroyBuffer(V.dev, g->buf, NULL); free(g); continue;
         }
         if (!bar) { vka_barrier(cb); bar = 1; }
-        VkBufferImageCopy r = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {im->w, im->h, 1}};
+        VkBufferImageCopy r = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {im->w, im->h, d}};
         vk.vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, g->buf, 1, &r);
-        g->key = g_cur; g->serial = im->serial; g->frame = vka_frame(); g->w = im->w; g->h = im->h; g->vkf = (uint32_t)im->f.vk; g->n = sz; g->after = g_after;
+        g->key = g_cur; g->serial = im->serial; g->frame = vka_frame(); g->w = im->w; g->h = im->h; g->d = d; g->vkf = (uint32_t)im->f.vk; g->n = sz; g->after = g_after;
         g_gd[g_ngd++] = g;
     }
     if (bar) {
@@ -235,7 +238,8 @@ static void q_report(void *arg) {   // the completion thread
          (unsigned long long)g_qkey[s], (unsigned long long)g_qframe[s], (unsigned long long)occ, r1 ? " (not available)" : "", (unsigned long long)ps[0], (unsigned long long)ps[1], (unsigned long long)ps[2],
          (unsigned long long)ps[3], (unsigned long long)ps[4], (unsigned long long)ps[5], r2 ? " (statistics not available)" : "");
 }
-int vka_nan_gpudump(void) { static int gd = -1; if (gd < 0) gd = getenv("DM_VK_NANSCAN_GPUDUMP") && atoi(getenv("DM_VK_NANSCAN_GPUDUMP")) > 0; return gd; }
+// Live (VKA_ENV): 0 off; each new non-zero value arms the dumps again (gdump_record's per-key frame counts and file total start over)
+int vka_nan_gpudump(void) { return VKA_ENV("DM_VK_NANSCAN_GPUDUMP", 0); }
 void vka_nan_dump_targets(VkCommandBuffer cb, vka_img *const *ims, int n) { g_after = 1; gdump_record(cb, ims, n); g_after = 0; }
 void vka_nan_inputs(VkCommandBuffer cb, vka_img *const *ims, const int *binds, const int *tids, int n) {
     batch_t *b = &g_b[g_bi % NBATCH];
