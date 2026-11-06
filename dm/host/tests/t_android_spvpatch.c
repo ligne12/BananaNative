@@ -22,8 +22,35 @@ static int validate(const uint32_t *w, size_t n, const char *tag) {
     return r == 0;
 }
 static int count_op(const uint32_t *w, size_t n, uint32_t op) { int k = 0; for (size_t i = 5; i < n; i += w[i] >> 16) { if (!(w[i] >> 16)) break; k += (w[i] & 0xffff) == op; } return k; }
+// vka_spv_pool_mark: DM_VK_POOL_SPV=<module> [<module>…] (colon-separated) rewrites each module that reads the texture pool (set 1, binding 0) with its bitmap at binding 3
+// and validates it; a module without such reads comes back NULL with no reason
+static void t_pool_mark(int val) {
+    const char *list = getenv("DM_VK_POOL_SPV"); if (!list) return;
+    char *buf = strdup(list); if (!buf) return;
+    for (char *p = strtok(buf, ":"); p; p = strtok(NULL, ":")) {
+        FILE *f = fopen(p, "rb"); if (!f) { CHECK(0, "pool_mark: %s not read", p); continue; }
+        fseek(f, 0, SEEK_END); long sz = ftell(f); rewind(f); uint32_t *w = malloc((size_t)sz);
+        if (fread(w, 1, (size_t)sz, f) != (size_t)sz) { fclose(f); free(w); continue; } fclose(f);
+        size_t on = 0; int nm = 0; char err[200] = "";
+        uint32_t *o = vka_spv_pool_mark(w, (size_t)sz / 4, 1, 0, 3, &on, &nm, err, sizeof err);
+        if (!o) { CHECK(!err[0], "pool_mark: %s refused: %s", p, err); printf("t_android_spvpatch: %s: nothing to mark\n", p); free(w); continue; }
+        CHECK(nm > 0 && count_op(o, on, 57) >= nm && count_op(o, on, 242) == 1, "pool_mark: %s: %d marks, %d calls, %d atomics", p, nm, count_op(o, on, 57), count_op(o, on, 242));
+        if (val) CHECK(validate(o, on, p), "pool_mark: %s does not validate", p);
+        int early = strstr(p, "pool_ps_") && vka_spv_early_ok(w, (size_t)sz / 4, 1, 1);   // (pixel shaders, as alpha-tested entries: one discard allowed with SpecId 1)
+        if (early) {   // the marked module with EarlyFragmentTests (vka_shader_early_module)
+            size_t en = 0; uint32_t *x = vka_spv_early_tests(o, on, &en, err, sizeof err);
+            CHECK(x && count_op(x, en, 16) == count_op(o, on, 16) + 1, "early tests: %s: %s", p, x ? "no execution mode added" : err);
+            if (x && val) CHECK(validate(x, en, p), "early tests: %s does not validate", p);
+            free(x);
+        }
+        printf("t_android_spvpatch: %s: %d pool reads marked%s\n", p, nm, early ? ", early depth tests kept" : "");
+        free(o); free(w);
+    }
+    free(buf);
+}
 int main(void) {
     int val = have_val();
+    t_pool_mark(val);
     size_t n = sizeof SPV_TRI_VERT / 4, on = 0; char err[200] = "";
     uint32_t *o = vka_spv_vin_retype(SPV_TRI_VERT, n, 1, 2, &on, err, sizeof err);
     CHECK(o, "selftest vertex shader not rewritten: %s", err);
@@ -48,6 +75,12 @@ int main(void) {
             free(f);
         }
         CHECK(!vka_spv_fout_retype(SPV_TRI_FRAG, fn, 2, 0, &on, err, sizeof err), "a location the module does not write is refused");
+        CHECK(vka_spv_early_ok(SPV_TRI_FRAG, fn, 1, 1), "the selftest fragment shader (its one discard the alpha test's) keeps early tests without the test");
+        CHECK(!vka_spv_early_ok(SPV_TRI_FRAG, fn, 0, 1), "a discard in an entry without the alpha test flag keeps the late tests");
+        uint32_t *x = vka_spv_early_tests(SPV_TRI_FRAG, fn, &on, err, sizeof err);
+        CHECK(x && count_op(x, on, 16) == count_op(SPV_TRI_FRAG, fn, 16) + 1, "EarlyFragmentTests added (%s)", err);
+        if (x && val) CHECK(validate(x, on, "selftest fragment (early tests)"), "valid SPIR-V");
+        if (x) { size_t n2 = 0; CHECK(!vka_spv_early_tests(x, on, &n2, err, sizeof err), "a module that has the mode is left alone"); free(x); }
         CHECK(!vka_spv_fout_retype(SPV_TRI_FRAG, fn, 1, 1, &on, err, sizeof err), "a location both uint and int is refused");
     }
     const char *dir = getenv("DM_VK_SPV_DIR");

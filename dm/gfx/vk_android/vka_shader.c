@@ -220,10 +220,25 @@ static void single_lane(uint64_t key, int stage, uint32_t **w, size_t *nb) {
                                                             stage == DMSH_VK_STAGE_GS && V.driver_id == VK_DRIVER_ID_MESA_TURNIP ? "Turnip's geometry stage (DM_VK_SUBGROUP_GS)" : V.subgroup_stages & g_stage_bit[stage] ? "the device's subgroup size in this stage is not the library's and cannot be pinned" : "the device has none in this stage");
     free(*w); *w = o; *nb = on * 4;
 }
-static VkShaderModule spv_module(const vka_shlib *L, const dmsh_vk_entry *e, const dmsh_vk_module *m, uint64_t key, const char **why, char *err, size_t errn) {
+// early: the marked module with EarlyFragmentTests (vka_shader_early_module), or VK_NULL_HANDLE with *why NULL when the shader has none (not eligible, or nothing marked)
+static VkShaderModule spv_module(const vka_shlib *L, const dmsh_vk_entry *e, const dmsh_vk_module *m, uint64_t key, int early, const char **why, char *err, size_t errn) {
     size_t nb = 0; uint32_t *w = vka_shlib_spirv(L, m, &nb, err, errn);
     if (!w) { *why = err; return VK_NULL_HANDLE; }
     if (e->flags & DMSH_VK_F_SUBGROUP) single_lane(key, e->stage, &w, &nb);
+    int pmb = vka_pool_mark_binding();
+    if (early && (pmb < 0 || !vka_spv_early_ok(w, nb / 4, (e->flags & DMSH_VK_F_ALPHA_TEST) != 0, DMSH_VK_SPEC_ALPHA_FUNC))) { free(w); *why = NULL; return VK_NULL_HANDLE; }
+    if (pmb >= 0) {   // reads of the texture pool set their IDs' bits (vka_tex.c "Texture IDs read through the pool")
+        size_t on = 0; int nm = 0; char e2[200] = ""; uint32_t *o = vka_spv_pool_mark(w, nb / 4, DMSH_VK_SET_POOL, DMSH_VK_POOL_TEX_BINDING, (uint32_t)pmb, &on, &nm, e2, sizeof e2);
+        if (o) { free(w); w = o; nb = on * 4; static _Atomic uint64_t nmod; uint64_t k = atomic_fetch_add(&nmod, 1) + 1;
+                 if (!early && (k <= 4 || !(k & (k - 1)))) VLOG("texture pool read marks: shader %016llx: %d reads marked (%llu modules so far)", (unsigned long long)key, nm, (unsigned long long)k); }
+        else if (early) { free(w); *why = NULL; return VK_NULL_HANDLE; }   // (nothing marked: the base module keeps its early tests)
+        else if (e2[0]) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) VRED("shader %016llx: its texture pool reads are not marked (%s): the IDs it reads may keep the null view", (unsigned long long)key, e2); }
+    }
+    if (early) {
+        size_t on = 0; char e3[160] = ""; uint32_t *o = vka_spv_early_tests(w, nb / 4, &on, e3, sizeof e3);
+        if (!o) { free(w); *why = NULL; return VK_NULL_HANDLE; }
+        free(w); w = o; nb = on * 4;
+    }
     VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = nb, .pCode = w};
     VkShaderModule mod = VK_NULL_HANDLE; VkResult r = vk.vkCreateShaderModule(V.dev, &ci, NULL, &mod);
     free(w);
@@ -236,12 +251,29 @@ VkShaderModule vka_shader_module(vka_shader *s, int variant) {
     const dmsh_vk_module *m = vka_shlib_module(s->lib, s->e, variant);
     if (!m) return VK_NULL_HANDLE;
     const char *why = NULL; char err[256];
-    VkShaderModule mod = spv_module(s->lib, s->e, m, s->key, &why, err, sizeof err);
+    VkShaderModule mod = spv_module(s->lib, s->e, m, s->key, 0, &why, err, sizeof err);
     if (!mod) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) VRED("shader %016llx variant %d: %s", (unsigned long long)s->key, variant, why); return VK_NULL_HANDLE; }
     pthread_mutex_lock(&g_mu);
     if (s->mods[variant]) { pthread_mutex_unlock(&g_mu); vk.vkDestroyShaderModule(V.dev, mod, NULL); return s->mods[variant]; }
     s->mods[variant] = mod;
     pthread_mutex_unlock(&g_mu);
+    return mod;
+}
+// DM_VK_POOL_MARK_EARLY (read once, on): a marked pixel shader that vka_spv_early_ok finds eligible gets a module with EarlyFragmentTests, which a pipeline without the
+// alpha test takes instead of the base one (vka_pso.c): the marks' atomic otherwise turns the early depth test off, and every hidden fragment runs its shader
+// (nxnative: [[early_fragment_tests]] on marked shaders kept the depth tests early). VK_NULL_HANDLE: the base module
+VkShaderModule vka_shader_early_module(struct vka_shader *s) {
+    static int on = -1; if (on < 0) on = VKA_ENV("DM_VK_POOL_MARK_EARLY", 1) != 0;
+    if (!on || s->e->stage != DMSH_VK_STAGE_FS || atomic_load(&s->early_state)) return s->early;
+    const dmsh_vk_module *m = vka_shlib_module(s->lib, s->e, DMSH_VK_MOD_BASE);
+    const char *why = NULL; char err[256];
+    VkShaderModule mod = m ? spv_module(s->lib, s->e, m, s->key, 1, &why, err, sizeof err) : VK_NULL_HANDLE;
+    if (!mod && why) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) VRED("shader %016llx early-test module: %s", (unsigned long long)s->key, why); }
+    pthread_mutex_lock(&g_mu);
+    if (atomic_load(&s->early_state)) { pthread_mutex_unlock(&g_mu); if (mod) vk.vkDestroyShaderModule(V.dev, mod, NULL); return s->early; }
+    s->early = mod; atomic_store(&s->early_state, mod ? 1 : -1);
+    pthread_mutex_unlock(&g_mu);
+    if (mod) { static _Atomic uint64_t n; uint64_t k = atomic_fetch_add(&n, 1) + 1; if (k <= 4 || !(k & (k - 1))) VLOG("texture pool read marks: shader %016llx keeps its early depth test (%llu so far)", (unsigned long long)s->key, (unsigned long long)k); }
     return mod;
 }
 // A geometry shader that writes memory, with those writes made by one run per primitive (vka_spv_gs_claim: the Adreno 840 runs a geometry shader several times for each
@@ -340,7 +372,7 @@ vka_shader *vka_shader_make(const vka_shlib *L, uint64_t key) {
         why = refusal(L, e);
         const dmsh_vk_module *m = why ? NULL : vka_shlib_module(L, e, DMSH_VK_MOD_BASE);
         if (!why && !m) why = "no base module";
-        if (m) s->mods[DMSH_VK_MOD_BASE] = spv_module(L, e, m, key, &why, err, sizeof err);
+        if (m) s->mods[DMSH_VK_MOD_BASE] = spv_module(L, e, m, key, 0, &why, err, sizeof err);
         if (!why && e->stage == DMSH_VK_STAGE_GS && VKA_ENV("DM_VK_GS_CLAIM", 1)) {   // memory writes: made once per primitive (vka_spv_gs_claim)
             char e2[256] = ""; s->gs_fx = gs_words(s, NULL, NULL, e2, sizeof e2);
             if (s->gs_fx < 0) VRED("geometry shader %016llx: memory writes not put under a claim (%s): drawn as it is, its writes repeated by the device's runs of each primitive", (unsigned long long)key, e2);

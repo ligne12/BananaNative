@@ -144,6 +144,25 @@ static int g_zwant;   // (under g_tmu) img_create_ may make a zero-shared image:
 // menu, which draws 19 times a frame. Until then the ID's slot in the pool table is the null view (lazy_defer); the flush writes the image there once its serial has one, or an
 // image was made over its storage (another texture object of that storage: a render target sampled through a texture of its own; lazy_wake)
 static int tex_lazy(void) { static int v = -1; if (v < 0) v = VKA_ENV("DM_VK_TEX_LAZY", 0) != 0; return v; }
+// ---------- Texture IDs read through the pool (with DM_VK_TEX_LAZY) ----------
+// A shader that reads the texture pool through a handle loaded from memory (the bindless table, set DMSH_VK_SET_POOL binding 0) may name any registered ID, and which ones
+// only the GPU knows, so such reads were never a use the host saw: their IDs kept the null view (Ocarina of Time: the door of Link's house, trunks and rocks unlit, about
+// 4,750 pixel shaders read the pool). Each such read now sets its ID's bit in a bitmap bound at the pool set's binding POOL_MARK_BINDING (vka_spvpatch.c vka_spv_pool_mark,
+// added at module creation, vka_shader.c), and an ID whose bit is set counts as used: lazy_wake makes it dirty and lazy_defer lets its image be made, at the next submission's
+// table flush, so its first frame still reads the null view. Registering an ID again clears its bit. The Mac host's read tracking is the same (nxnative, memory.md "Shaders
+// report which textures they read through a pool"). DM_VK_POOL_MARK=0 (read once) turns it off. Decided once with the bitmap made, so every module and the set's layout agree
+enum { POOL_MARK_BINDING = 3, POOL_MARK_WORDS = (1 << 20) / 32 };
+static _Atomic uint32_t *g_pm; static vka_span g_pm_span; static uint64_t g_pm_woken;
+static pthread_once_t g_pm_once = PTHREAD_ONCE_INIT;
+static void pm_init(void) {
+    if (!tex_lazy() || !VKA_ENV("DM_VK_POOL_MARK", 1)) return;
+    if (!V.frag_atomics || !V.vert_atomics) { VRED("texture pool read marks: the device has no stores in fragment or vertex shaders: IDs read through the pool keep the null view"); return; }
+    if (!vka_static((VkDeviceSize)POOL_MARK_WORDS * 4, V.sb_align ? V.sb_align : 64, &g_pm_span)) { VRED("texture pool read marks: no memory for the bitmap"); return; }
+    memset(g_pm_span.ptr, 0, (size_t)POOL_MARK_WORDS * 4); g_pm = (_Atomic uint32_t *)(void *)g_pm_span.ptr;
+    VLOG("texture pool read marks: shaders that read the pool set the read IDs' bits (DM_VK_POOL_MARK=0 off)");
+}
+int vka_pool_mark_binding(void) { pthread_once(&g_pm_once, pm_init); return g_pm ? POOL_MARK_BINDING : -1; }
+static int pm_read(int id) { return g_pm && id >= 0 && id < (1 << 20) && (atomic_load_explicit(&g_pm[id >> 5], memory_order_relaxed) >> (id & 31) & 1); }
 static int *g_lz, g_nlz, g_lzcap; static uint8_t *g_lzflag;   // (under g_tmu) the IDs waiting, a flag per ID
 static uint64_t *g_lzmem; static size_t g_lzmemcap, g_lzmemn;   // (under g_tmu) the storage addresses of the images made, a set (open addressing)
 static uint64_t g_ev_n, g_ev_bytes, g_ev_rounds;   // (under g_tmu) DM_VK_TEX_EVICT_MB: images evicted, their bytes, rounds that evicted
@@ -214,7 +233,7 @@ void vka_tex_alias_stats(char *b, size_t n) {
         VLOG("ctl: GPU-written images: %d, %.0f MB (%.0f MB without storage), their storage ranges cover %.0f MB, %d start inside another's; largest: %s", nv, sum / 1e6, nomem / 1e6, uni / 1e6, nov, top);
     }
     if (tex_lazy()) { size_t l = strlen(b); pthread_mutex_lock(&g_tmu);
-        if (l < n) snprintf(b + l, n - l, "; lazy texture IDs (DM_VK_TEX_LAZY): %d waiting for a use, %llu deferred, %llu given their image later; evicted %llu images (%.0f MiB, DM_VK_TEX_EVICT_MB)", g_nlz, (unsigned long long)g_lz_deferred, (unsigned long long)g_lz_woken, (unsigned long long)g_ev_n, g_ev_bytes / 1048576.0);
+        if (l < n) snprintf(b + l, n - l, "; lazy texture IDs (DM_VK_TEX_LAZY): %d waiting for a use, %llu deferred, %llu given their image later (%llu of them read through the pool); evicted %llu images (%.0f MiB, DM_VK_TEX_EVICT_MB)", g_nlz, (unsigned long long)g_lz_deferred, (unsigned long long)g_lz_woken, (unsigned long long)g_pm_woken, (unsigned long long)g_ev_n, g_ev_bytes / 1048576.0);
         pthread_mutex_unlock(&g_tmu); }
 }
 static size_t hslot(uint64_t s, size_t cap) { return (size_t)((s * 0x9E3779B97F4A7C15ull) >> 20) & (cap - 1); }
@@ -1593,6 +1612,15 @@ void mtl_tex_release(tex_t *t) {
 // Linear textures the GPU wrote in this submission. Metal makes a linear texture on the pool buffer, so what the GPU renders there is in guest memory for the CPU to read
 // (agl reads small linear render targets back on the CPU, such as a 1x1 R16F one in Donkey Kong Bananza's level); here the image is copied back into the storage
 static vka_img **g_wb; static int g_nwb, g_wbcap;
+// DM_VK_WB_LOG=<n> (live; each new value starts the count again): for the next n copies back of a linear texture of at most 16 bytes, its storage's words once the GPU is
+// done (frame, serial, as floats and as hex): what the CPU reads back (agl's 1x1 RGBA32F exposure targets in Ocarina of Time)
+typedef struct { uint64_t serial, frame; const uint8_t *mem; uint32_t n; } wb_peek;
+static void wb_peek_log(void *arg) {
+    wb_peek *p = arg; uint32_t w[4] = {0}; float f[4]; memcpy(w, p->mem, p->n); memcpy(f, w, sizeof f);
+    VLOG("linear texture serial %llu, frame %llu, its storage after the copy back: %g %g %g %g (%08x %08x %08x %08x)", (unsigned long long)p->serial, (unsigned long long)p->frame,
+         p->n > 0 ? f[0] : 0.0, p->n > 4 ? f[1] : 0.0, p->n > 8 ? f[2] : 0.0, p->n > 12 ? f[3] : 0.0, w[0], w[1], w[2], w[3]);
+    free(p);
+}
 void vka_img_written_at(vka_img *im, const char *file, int line) {
     if (!im) return;
     pthread_mutex_lock(&g_tmu);
@@ -1612,15 +1640,6 @@ void vka_img_written_at(vka_img *im, const char *file, int line) {
 void vka_tex_writeback(VkCommandBuffer cb) {
     pthread_mutex_lock(&g_tmu);
     int any = 0;
-// DM_VK_WB_LOG=<n> (live; each new value starts the count again): for the next n copies back of a linear texture of at most 16 bytes, its storage's words once the GPU is
-// done (frame, serial, as floats and as hex): what the CPU reads back (agl's 1x1 RGBA32F exposure targets in Ocarina of Time)
-typedef struct { uint64_t serial, frame; const uint8_t *mem; uint32_t n; } wb_peek;
-static void wb_peek_log(void *arg) {
-    wb_peek *p = arg; uint32_t w[4] = {0}; float f[4]; memcpy(w, p->mem, p->n); memcpy(f, w, sizeof f);
-    VLOG("linear texture serial %llu, frame %llu, its storage after the copy back: %g %g %g %g (%08x %08x %08x %08x)", (unsigned long long)p->serial, (unsigned long long)p->frame,
-         p->n > 0 ? f[0] : 0.0, p->n > 4 ? f[1] : 0.0, p->n > 8 ? f[2] : 0.0, p->n > 12 ? f[3] : 0.0, w[0], w[1], w[2], w[3]);
-    free(p);
-}
     for (int i = 0; i < g_nwb; i++) {
         vka_img *im = g_wb[i]; im->wb_pending = 0;
         uint32_t bpb = im->f.bpb, h = im->h; size_t row = im->d.stride ? im->d.stride : (size_t)im->w * bpb;
@@ -1631,6 +1650,15 @@ static void wb_peek_log(void *arg) {
         VkBufferImageCopy c = {o, (uint32_t)(row / bpb), h, {im->aspect, 0, 0, 1}, {0, 0, 0}, {im->w, h, 1}};
         vk.vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, b, 1, &c);
         static _Atomic int n; if (atomic_fetch_add(&n, 1) < 4) VLOG("linear texture serial %llu %ux%u format %#x: the GPU's content copied back into its storage", (unsigned long long)im->serial, im->w, h, im->d.format);
+        {   // DM_VK_WB_LOG
+            static int last; static _Atomic int left; int want = VKA_ENV("DM_VK_WB_LOG", 0);
+            if (want != last) { last = want; atomic_store(&left, want); }
+            size_t sz = (size_t)row * (h - 1) + (size_t)im->w * bpb;
+            if (sz <= 16 && atomic_load(&left) > 0 && atomic_fetch_sub(&left, 1) > 0) {
+                wb_peek *p = malloc(sizeof *p);
+                if (p) { *p = (wb_peek){im->serial, vka_frame(), (const uint8_t *)im->mem, (uint32_t)sz}; vka_after(vka_fence_last() + 1, wb_peek_log, p); }
+            }
+        }
         unref_locked(im);
     }
     g_nwb = 0;
@@ -1650,15 +1678,6 @@ void mtl_tex_cpu_written(const tex_t *t) {
     smap_ent *e = map_get(t->serial);
     if (!e) cpuw_take(t->serial, 1);
     else if (e->im && !e->im->gpu_owned && !e->im->cpu_dirty) {
-        {   // DM_VK_WB_LOG
-            static int last; static _Atomic int left; int want = VKA_ENV("DM_VK_WB_LOG", 0);
-            if (want != last) { last = want; atomic_store(&left, want); }
-            size_t sz = (size_t)row * (h - 1) + (size_t)im->w * bpb;
-            if (sz <= 16 && atomic_load(&left) > 0 && atomic_fetch_sub(&left, 1) > 0) {
-                wb_peek *p = malloc(sizeof *p);
-                if (p) { *p = (wb_peek){im->serial, vka_frame(), (const uint8_t *)im->mem, (uint32_t)sz}; vka_after(vka_fence_last() + 1, wb_peek_log, p); }
-            }
-        }
         e->im->cpu_dirty = 1;
         if (g_nredo == g_redocap) { g_redocap = g_redocap ? g_redocap * 2 : 64; g_redo = realloc(g_redo, (size_t)g_redocap * sizeof *g_redo); }
         g_redo[g_nredo++] = t->serial;
@@ -1693,19 +1712,27 @@ static void bindless_init(void) {
     g_nimg_slots = MIN(1u << 16, HEAD(MIN(p12.maxDescriptorSetUpdateAfterBindStorageImages, p12.maxPerStageDescriptorUpdateAfterBindStorageImages)));
 #undef HEAD
 #undef MIN
-    VkDescriptorSetLayoutBinding b[3] = {{0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, g_ntex_slots, VK_SHADER_STAGE_ALL, NULL}, {1, VK_DESCRIPTOR_TYPE_SAMPLER, g_nsamp_slots, VK_SHADER_STAGE_ALL, NULL},
+    VkDescriptorSetLayoutBinding b[4] = {{0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, g_ntex_slots, VK_SHADER_STAGE_ALL, NULL}, {1, VK_DESCRIPTOR_TYPE_SAMPLER, g_nsamp_slots, VK_SHADER_STAGE_ALL, NULL},
                                          {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, g_nimg_slots, VK_SHADER_STAGE_ALL, NULL}};
-    VkDescriptorBindingFlags bf = VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT | VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT, bfs[3] = {bf, bf, bf};
+    VkDescriptorBindingFlags bf = VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT | VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT, bfs[4] = {bf, bf, bf, 0};
     uint32_t nb = g_nimg_slots ? 3 : 2;
+    int pmb = vka_pool_mark_binding();   // the read bitmap (written once below, so not update-after-bind)
+    if (pmb >= 0) { b[nb] = (VkDescriptorSetLayoutBinding){(uint32_t)pmb, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL, NULL}; bfs[nb] = 0; nb++; }
     VkDescriptorSetLayoutBindingFlagsCreateInfo bfi = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO, .bindingCount = nb, .pBindingFlags = bfs};
     VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .pNext = &bfi, .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT, .bindingCount = nb, .pBindings = b};
-    VkDescriptorPoolSize ps[3] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, g_ntex_slots}, {VK_DESCRIPTOR_TYPE_SAMPLER, g_nsamp_slots}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, g_nimg_slots}};
-    VkDescriptorPoolCreateInfo pi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT, .maxSets = 1, .poolSizeCount = nb, .pPoolSizes = ps};
+    VkDescriptorPoolSize ps[4] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, g_ntex_slots}, {VK_DESCRIPTOR_TYPE_SAMPLER, g_nsamp_slots}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, g_nimg_slots}};
+    uint32_t nps = g_nimg_slots ? 3 : 2; if (pmb >= 0) ps[nps++] = (VkDescriptorPoolSize){VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1};
+    VkDescriptorPoolCreateInfo pi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT, .maxSets = 1, .poolSizeCount = nps, .pPoolSizes = ps};
     VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorSetCount = 1, .pSetLayouts = &g_dsl};
     VkResult r;
     if ((r = vk.vkCreateDescriptorSetLayout(V.dev, &li, NULL, &g_dsl)) || (r = vk.vkCreateDescriptorPool(V.dev, &pi, NULL, &g_dpool)) || ((ai.descriptorPool = g_dpool), (r = vk.vkAllocateDescriptorSets(V.dev, &ai, &g_set)))) {
         VRED("bindless set (%u textures, %u samplers, %u images): %d", g_ntex_slots, g_nsamp_slots, g_nimg_slots, r); g_set = VK_NULL_HANDLE; return; }
-    VLOG("bindless tables: %u textures, %u samplers, %u images (update after bind)", g_ntex_slots, g_nsamp_slots, g_nimg_slots);
+    if (pmb >= 0) {
+        VkDescriptorBufferInfo bi = {g_pm_span.buf, g_pm_span.off, (VkDeviceSize)POOL_MARK_WORDS * 4};
+        VkWriteDescriptorSet wd = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g_set, .dstBinding = (uint32_t)pmb, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi};
+        vk.vkUpdateDescriptorSets(V.dev, 1, &wd, 0, NULL);
+    }
+    VLOG("bindless tables: %u textures, %u samplers, %u images (update after bind)%s", g_ntex_slots, g_nsamp_slots, g_nimg_slots, pmb >= 0 ? ", the read bitmap at binding 3" : "");
 }
 VkDescriptorSet vka_bindless_set(void) { return g_set; }
 VkDescriptorSetLayout vka_bindless_layout(void) { return g_dsl; }
@@ -1722,6 +1749,7 @@ static void treg(int id, const tex_t *t, const view_t *v, int img) {
     pthread_mutex_lock(&g_tmu);
     if (id >= g_ntreg) { int n = g_ntreg ? g_ntreg : 1024; while (n <= id) n *= 2; g_treg = realloc(g_treg, (size_t)n * sizeof *g_treg); memset(g_treg + g_ntreg, 0, (size_t)(n - g_ntreg) * sizeof *g_treg); g_ntreg = n; }
     treg_ent *e = &g_treg[id]; e->t = *t; e->has_v = v != NULL; if (v) e->v = *v; e->img = (uint8_t)img; e->pgen = nvn_pool_live(t->pool, NULL, NULL);
+    if (g_pm && !img) atomic_fetch_and_explicit(&g_pm[id >> 5], ~(1u << (id & 31)), memory_order_relaxed);   // (another texture at this ID: read again before it counts)
     dirty(&g_tdirty, &g_ntd, &g_tdcap, &g_tdflag, 1 << 20, id);
     if (!g_tver) g_tver = calloc(1 << 20, sizeof *g_tver);
     if (g_tver) atomic_fetch_add_explicit(&g_tver[id], 1, memory_order_release);
@@ -1866,7 +1894,7 @@ static int treg_dead(int id, const treg_ent *e) {
 static int lazy_defer(int id) {
     if (!tex_lazy()) return 0;
     const treg_ent *e = &g_treg[id];
-    if (e->img || !e->t.serial || map_get(e->t.serial) || lzmem_has((uint64_t)(uintptr_t)e->t.mem)) return 0;
+    if (e->img || !e->t.serial || map_get(e->t.serial) || lzmem_has((uint64_t)(uintptr_t)e->t.mem) || pm_read(id)) return 0;
     if (!g_lzflag && !(g_lzflag = calloc(1 << 20, 1))) return 0;
     if (!g_lzflag[id]) {
         if (g_nlz == g_lzcap) { int nc = g_lzcap ? g_lzcap * 2 : 1024; int *n = realloc(g_lz, (size_t)nc * sizeof *n); if (!n) return 0; g_lz = n; g_lzcap = nc; }
@@ -1877,13 +1905,14 @@ static int lazy_defer(int id) {
 // (under g_tmu) The waiting IDs that have an image now (a draw or a copy used them, or one made an image over their storage) are dirty again: this flush writes their slot.
 // Looked at only when vka_tex_get mapped a serial since the last look
 static void lazy_wake(void) {
-    if (!g_nlz || g_made == g_lz_seen) return;
+    if (!g_nlz || (g_made == g_lz_seen && !g_pm)) return;   // (with the read marks, every flush: a shader may have read one)
     g_lz_seen = g_made;
     int k = 0;
     for (int i = 0; i < g_nlz; i++) {
         int id = g_lz[i]; const treg_ent *e = id < g_ntreg ? &g_treg[id] : NULL;
-        if (e && e->t.serial && !e->img && !map_get(e->t.serial) && !lzmem_has((uint64_t)(uintptr_t)e->t.mem)) { g_lz[k++] = id; continue; }
-        g_lzflag[id] = 0;
+        int rd = pm_read(id);
+        if (e && e->t.serial && !e->img && !map_get(e->t.serial) && !lzmem_has((uint64_t)(uintptr_t)e->t.mem) && !rd) { g_lz[k++] = id; continue; }
+        g_lzflag[id] = 0; if (rd) g_pm_woken++;
         if (e && e->t.serial) { dirty(&g_tdirty, &g_ntd, &g_tdcap, &g_tdflag, 1 << 20, id); g_lz_woken++; }
     }
     g_nlz = k;

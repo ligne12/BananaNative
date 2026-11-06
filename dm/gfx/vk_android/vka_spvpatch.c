@@ -24,6 +24,119 @@ static int put(vec_t *v, uint32_t x) {
 }
 static int put_n(vec_t *v, const uint32_t *x, size_t n) { for (size_t i = 0; i < n; i++) if (!put(v, x[i])) return 0; return 1; }
 
+// vka_spv_pool_mark: which texture IDs a shader reads through the pool (a handle loaded from memory: the bindless table, set `set` binding `binding`) is known only on the GPU,
+// and with DM_VK_TEX_LAZY an ID gets its image only at a use the host sees (vka_tex.c "Texture IDs read through the pool"). So after each OpAccessChain into a pool variable
+// the module calls an added function with the index: word = id >> 5, bit = 1 << (id & 31) of a bitmap of uint words bound at (set, mark_binding); the word is read first and
+// only a clear bit is set (OpAtomicOr), so nearly every read costs a load (the Mac host's dm_pool_mark, nxnative "Shaders report which textures they read through a pool").
+// An index of a type other than a 32-bit integer, or whose definition is not one of the common integer instructions below, is left unmarked. SPIR-V 1.3 and later: the
+// bitmap is a StorageBuffer variable, which from 1.4 on every entry point lists in its interface (added to each OpEntryPoint)
+uint32_t *vka_spv_pool_mark(const uint32_t *w, size_t nw, uint32_t set, uint32_t binding, uint32_t mark_binding, size_t *out_nw, int *nmarks, char *err, size_t errn) {
+    enum { OpTypeVoid = 19, OpTypeBool = 20, OpTypeRuntimeArray = 29, OpTypeStruct = 30, OpTypeFunction = 33, OpConstant = 43, OpFunctionParameter = 55, OpFunctionCall = 57,
+           OpLabel = 248, OpSelectionMerge = 247, OpBranch = 249, OpBranchConditional = 250, OpReturn = 253, OpFunctionEnd = 56, OpShiftRightLogical = 194, OpShiftLeftLogical = 196,
+           OpBitwiseAnd = 199, OpIEqual = 170, OpAtomicOr = 242, OpCopyObject = 83, OpCompositeExtract = 81, OpSelect = 169, OpIAdd = 128, OpISub = 130, OpIMul = 132,
+           OpUConvert = 113, OpSConvert = 114, OpBitwiseOr = 197, OpBitFieldUExtract = 202, OpPhi = 245, OpExtInstOp = 12, OpUndef = 1,
+           DecBinding = 33, DecDescriptorSet = 34, DecBlock = 2, DecOffset = 35, DecArrayStride = 6, SCStorageBuffer = 12 };
+    *out_nw = 0; *nmarks = 0; if (errn) err[0] = 0;
+    if (nw < 5 || w[0] != 0x07230203) { snprintf(err, errn, "not SPIR-V"); return NULL; }
+    if (w[1] < 0x00010300) { snprintf(err, errn, "SPIR-V version %#x (before 1.3 no StorageBuffer class)", w[1]); return NULL; }
+    int iface = w[1] >= 0x00010400;   // (from 1.4 an entry point's interface lists every global variable it uses)
+    uint32_t bound = w[3];
+    uint32_t *dset = calloc(bound, 4), *dbind = calloc(bound, 4), *type_of = calloc(bound, 4), *def_at = calloc(bound, 4);   // per id; def_at: the defining instruction's word + 1
+    uint8_t *isint = calloc(bound, 1);   // 1: an OpTypeInt 32 unsigned, 2: signed
+    size_t *site = NULL; int nsite = 0, csite = 0;
+    if (!dset || !dbind || !type_of || !def_at || !isint) { snprintf(err, errn, "no memory"); goto fail; }
+    for (uint32_t i = 0; i < bound; i++) dset[i] = dbind[i] = ~0u;
+    uint32_t t_void = 0, t_bool = 0, t_uint = 0, t_fn = 0, c[4] = {0};   // c: uint constants 0, 1, 5, 31
+    static const uint32_t cval[4] = {0, 1, 5, 31};
+    size_t first_dec = 0, first_fn = 0;
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = w[i] & 0xffff, ln = w[i] >> 16;
+        if (!ln || i + ln > nw) { snprintf(err, errn, "bad instruction at word %zu", i); goto fail; }
+        if (op == OpDecorate && ln >= 4 && w[i + 1] < bound) { if (!first_dec) first_dec = i; if (w[i + 2] == DecDescriptorSet) dset[w[i + 1]] = w[i + 3]; if (w[i + 2] == DecBinding) dbind[w[i + 1]] = w[i + 3]; }
+        else if ((op == OpMemberDecorate || op == OpDecorateId || op == OpDecorateString || op == OpMemberDecorateString) && !first_dec) first_dec = i;
+        else if (op == OpTypeVoid && ln == 2) t_void = w[i + 1];
+        else if (op == OpTypeBool && ln == 2) t_bool = w[i + 1];
+        else if (op == OpTypeInt && ln == 4 && w[i + 2] == 32 && w[i + 1] < bound) { isint[w[i + 1]] = w[i + 3] ? 2 : 1; if (!w[i + 3]) t_uint = w[i + 1]; }
+        else if (op == OpTypeFunction && ln == 4 && t_void && t_uint && w[i + 2] == t_void && w[i + 3] == t_uint) t_fn = w[i + 1];
+        else if (op == OpConstant && ln == 4 && t_uint && w[i + 1] == t_uint) { for (int k = 0; k < 4; k++) if (!c[k] && w[i + 3] == cval[k]) c[k] = w[i + 2]; }
+        else if (op == OpFunction && !first_fn) first_fn = i;
+        if ((op == OpAccessChain || op == OpInBoundsAccessChain) && ln >= 5 && w[i + 3] < bound && dset[w[i + 3]] == set && dbind[w[i + 3]] == binding) {
+            if (nsite == csite) { csite = csite ? 2 * csite : 16; size_t *p = realloc(site, (size_t)csite * sizeof *p); if (!p) { snprintf(err, errn, "no memory"); goto fail; } site = p; }
+            site[nsite++] = i;
+        }
+        switch (op) {   // result type and id at words 1 and 2: the integer instructions an index is made with
+        case OpLoad: case OpBitcast: case OpCopyObject: case OpCompositeExtract: case OpSelect: case OpIAdd: case OpISub: case OpIMul: case OpUConvert: case OpSConvert:
+        case OpBitwiseAnd: case OpBitwiseOr: case OpShiftRightLogical: case OpShiftLeftLogical: case OpBitFieldUExtract: case OpPhi: case OpExtInstOp: case OpConstant: case OpUndef:
+            if (ln >= 3 && w[i + 2] < bound) { type_of[w[i + 2]] = w[i + 1]; def_at[w[i + 2]] = (uint32_t)i + 1; }
+            break;
+        }
+        i += ln;
+    }
+    if (!nsite) goto fail;   // (nothing to mark: err stays empty)
+    if (!first_dec || !first_fn) { snprintf(err, errn, "no decoration or no function"); goto fail; }
+    for (size_t i = 5; i < first_fn;) { uint32_t op = w[i] & 0xffff, ln = w[i] >> 16; if (op == OpTypeFunction && ln == 4 && t_void && t_uint && w[i + 2] == t_void && w[i + 3] == t_uint) t_fn = w[i + 1]; i += ln; }   // (one declared before uint)
+    vec_t o = {0}; uint32_t nid = bound;
+    uint32_t n_void = t_void ? t_void : nid++, n_bool = t_bool ? t_bool : nid++, n_uint = t_uint ? t_uint : nid++, n_fn = t_fn ? t_fn : nid++, n_c[4];
+    for (int k = 0; k < 4; k++) n_c[k] = c[k] ? c[k] : nid++;
+    uint32_t p_u = nid++, rt = nid++, st = nid++, p_s = nid++, var = nid++, fn = nid++, par = nid++, l0 = nid++, l1 = nid++, l2 = nid++,
+             wd = nid++, b = nid++, bit = nid++, pw = nid++, v = nid++, has = nid++, z = nid++, at = nid++;
+    if (!put_n(&o, w, 5)) goto nomem;
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = w[i] & 0xffff, ln = w[i] >> 16;
+        if (i == first_dec) {   // the bitmap's decorations
+            uint32_t d[] = {4u << 16 | OpDecorate, var, DecDescriptorSet, set, 4u << 16 | OpDecorate, var, DecBinding, mark_binding, 3u << 16 | OpDecorate, st, DecBlock,
+                            5u << 16 | OpMemberDecorate, st, 0, DecOffset, 0, 4u << 16 | OpDecorate, rt, DecArrayStride, 4};
+            if (!put_n(&o, d, sizeof d / 4)) goto nomem;
+        }
+        if (i == first_fn) {   // its types, constants and variable, at the end of the global declarations
+            if (!t_void && (!put(&o, 2u << 16 | OpTypeVoid) || !put(&o, n_void))) goto nomem;
+            if (!t_bool && (!put(&o, 2u << 16 | OpTypeBool) || !put(&o, n_bool))) goto nomem;
+            if (!t_uint) { uint32_t d[] = {4u << 16 | OpTypeInt, n_uint, 32, 0}; if (!put_n(&o, d, 4)) goto nomem; }
+            if (!t_fn) { uint32_t d[] = {4u << 16 | OpTypeFunction, n_fn, n_void, n_uint}; if (!put_n(&o, d, 4)) goto nomem; }
+            for (int k = 0; k < 4; k++) if (!c[k]) { uint32_t d[] = {4u << 16 | OpConstant, n_uint, n_c[k], cval[k]}; if (!put_n(&o, d, 4)) goto nomem; }
+            uint32_t d[] = {4u << 16 | OpTypePointer, p_u, SCStorageBuffer, n_uint, 3u << 16 | OpTypeRuntimeArray, rt, n_uint, 3u << 16 | OpTypeStruct, st, rt,
+                            4u << 16 | OpTypePointer, p_s, SCStorageBuffer, st, 4u << 16 | OpVariable, p_s, var, SCStorageBuffer};
+            if (!put_n(&o, d, sizeof d / 4)) goto nomem;
+        }
+        if (op == OpEntryPoint && iface) {   // the bitmap at the end of its interface
+            if (!put(&o, (ln + 1) << 16 | OpEntryPoint) || !put_n(&o, w + i + 1, ln - 1) || !put(&o, var)) goto nomem;
+            i += ln; continue;
+        }
+        if (!put_n(&o, w + i, ln)) goto nomem;
+        if ((op == OpAccessChain || op == OpInBoundsAccessChain) && ln >= 5 && w[i + 3] < bound && dset[w[i + 3]] == set && dbind[w[i + 3]] == binding) {
+            uint32_t idx = w[i + 4], ty = idx < bound ? type_of[idx] : 0;
+            if (!ty || ty >= bound || !isint[ty]) { i += ln; continue; }   // (not a 32-bit integer the walk knows: unmarked)
+            if (isint[ty] == 2) {   // a signed index: the uint it was cast from, else a cast
+                uint32_t d = def_at[idx];
+                if (d && (w[d - 1] & 0xffff) == OpBitcast && (w[d - 1] >> 16) == 4 && w[d + 2] < bound && type_of[w[d + 2]] == n_uint) idx = w[d + 2];
+                else { uint32_t u = nid++, x[] = {4u << 16 | OpBitcast, n_uint, u, idx}; if (!put_n(&o, x, 4)) goto nomem; idx = u; }
+            }
+            uint32_t call[] = {5u << 16 | OpFunctionCall, n_void, nid++, fn, idx};
+            if (!put_n(&o, call, 5)) goto nomem;
+            (*nmarks)++;
+        }
+        i += ln;
+    }
+    {   // the mark: void fn(uint id)
+        uint32_t d[] = {5u << 16 | OpFunction, n_void, fn, 0, n_fn, 3u << 16 | OpFunctionParameter, n_uint, par, 2u << 16 | OpLabel, l0,
+                        5u << 16 | OpShiftRightLogical, n_uint, wd, par, n_c[2], 5u << 16 | OpBitwiseAnd, n_uint, b, par, n_c[3], 5u << 16 | OpShiftLeftLogical, n_uint, bit, n_c[1], b,
+                        6u << 16 | OpAccessChain, p_u, pw, var, n_c[0], wd, 4u << 16 | OpLoad, n_uint, v, pw, 5u << 16 | OpBitwiseAnd, n_uint, has, v, bit,
+                        5u << 16 | OpIEqual, n_bool, z, has, n_c[0], 3u << 16 | OpSelectionMerge, l2, 0, 4u << 16 | OpBranchConditional, z, l1, l2,
+                        2u << 16 | OpLabel, l1, 7u << 16 | OpAtomicOr, n_uint, at, pw, n_c[1], n_c[0], bit, 2u << 16 | OpBranch, l2,   // (scope 1 Device, semantics 0 Relaxed)
+                        2u << 16 | OpLabel, l2, 1u << 16 | OpReturn, 1u << 16 | OpFunctionEnd};
+        if (!put_n(&o, d, sizeof d / 4)) goto nomem;
+    }
+    if (!*nmarks) { free(o.w); goto fail; }   // (every index of an unknown type: nothing marked, err empty)
+    o.w[3] = nid; *out_nw = o.n;
+    free(dset); free(dbind); free(type_of); free(def_at); free(isint); free(site);
+    return o.w;
+nomem:
+    free(o.w); snprintf(err, errn, "no memory");
+fail:
+    free(dset); free(dbind); free(type_of); free(def_at); free(isint); free(site);
+    return NULL;
+}
+
 uint32_t *vka_spv_vin_retype(const uint32_t *w, size_t nw, uint32_t umask, uint32_t smask, size_t *out_nw, char *err, size_t errn) {
 #define FAIL(...) do { snprintf(err, errn, __VA_ARGS__); goto fail; } while (0)
     uint32_t *cls = NULL; vec_t o = {0};   // cls[id]: 0 untouched, 1 a retyped input or a chain into one, as uint, 2 as int (bit 4: the id is a pointer to a vec4)
@@ -487,4 +600,64 @@ fail:
     free(cls); free(loc); free(ty); free(o.w);
     return NULL;
 #undef FAIL
+}
+
+// A pixel shader that may keep early depth / stencil tests once its pool reads are marked (vka_spv_pool_mark's atomic turns them off on drivers that see a side effect):
+// asked of the module before the marks. No FragDepth / SampleMask / FragStencilRefEXT variable, no store of its own (OpImageWrite, an atomic, OpStore or OpCopyMemory
+// into a StorageBuffer, Uniform or PhysicalStorageBuffer pointer), and no discard (OpKill, OpTerminateInvocation, OpDemoteToHelperInvocation) except one with the alpha
+// test (alpha_test: the entry has DMSH_VK_F_ALPHA_TEST, and the module its specialization constant spec_alpha), which a pipeline without the test never reaches.
+// 1 = eligible when the pipeline's alpha test is off (nxnative: marked shaders declare [[early_fragment_tests]]; Ocarina of Time, 3,130 of 4,754 marked pixel shaders)
+int vka_spv_early_ok(const uint32_t *w, size_t nw, int alpha_test, uint32_t spec_alpha) {
+    enum { OpTypePointer = 32, OpVariable = 59, OpStore = 62, OpCopyMemory = 63, OpAccessChain = 65, OpInBoundsAccessChain = 66, OpPtrAccessChain = 67, OpImageWrite = 99,
+           OpConvertUToPtr = 120, OpKill = 252, OpTerminateInvocation = 4416, OpDemote = 5380, DecBuiltIn = 11, DecSpecId = 1,
+           BIFragDepth = 22, BISampleMask = 20, BIFragStencilRef = 5014, SCUniform = 2, SCStorageBuffer = 12, SCPhysical = 5349 };
+    if (nw < 5 || w[0] != 0x07230203) return 0;
+    uint32_t bound = w[3]; uint32_t *sc = calloc(bound ? bound : 1, 4);   // per id: the storage class a pointer (type, variable or chain) leads to, +1 (0 = none)
+    if (!sc) return 0;
+    int kills = 0, spec = 0, bad = 0;
+    for (size_t i = 5; i < nw && !bad;) {
+        uint32_t op = w[i] & 0xffff, ln = w[i] >> 16;
+        if (!ln || i + ln > nw) { bad = 1; break; }
+        if (op == OpDecorate && ln >= 4 && w[i + 2] == DecBuiltIn && (w[i + 3] == BIFragDepth || w[i + 3] == BISampleMask || w[i + 3] == BIFragStencilRef)) bad = 1;
+        else if (op == OpDecorate && ln >= 4 && w[i + 2] == DecSpecId && w[i + 3] == spec_alpha) spec = 1;
+        else if (op == OpTypePointer && ln == 4 && w[i + 1] < bound) sc[w[i + 1]] = w[i + 2] + 1;
+        else if (op == OpVariable && ln >= 4 && w[i + 2] < bound) sc[w[i + 2]] = w[i + 3] + 1;
+        else if ((op == OpAccessChain || op == OpInBoundsAccessChain || op == OpPtrAccessChain) && ln >= 4 && w[i + 2] < bound && w[i + 3] < bound)
+            sc[w[i + 2]] = sc[w[i + 3]] ? sc[w[i + 3]] : (w[i + 1] < bound ? sc[w[i + 1]] : 0);
+        else if (op == OpConvertUToPtr && ln >= 4 && w[i + 2] < bound) sc[w[i + 2]] = SCPhysical + 1;
+        else if (op == OpKill || op == OpTerminateInvocation || op == OpDemote) kills++;
+        else if (op == OpImageWrite || (op >= 227 && op <= 242) || op == 4417 || op == 5614 || op == 5615) bad = 1;   // OpAtomicLoad … OpAtomicXor, the float atomics
+        else if ((op == OpStore || op == OpCopyMemory) && ln >= 3 && w[i + 1] < bound) {
+            uint32_t c = sc[w[i + 1]];
+            if (c == SCStorageBuffer + 1 || c == SCUniform + 1 || c == SCPhysical + 1) bad = 1;
+        }
+        i += ln;
+    }
+    free(sc);
+    if (bad) return 0;
+    return kills == 0 || (kills == 1 && alpha_test && spec);
+}
+// The module with OpExecutionMode EarlyFragmentTests on each fragment entry point (after the entry points and execution modes); NULL with err set when there is none
+uint32_t *vka_spv_early_tests(const uint32_t *w, size_t nw, size_t *out_nw, char *err, size_t errn) {
+    enum { OpEntryPoint = 15, OpExecutionMode = 16, OpExecutionModeId = 331, ModelFragment = 4, ModeEarlyTests = 9 };
+    *out_nw = 0; if (errn) err[0] = 0;
+    if (nw < 5 || w[0] != 0x07230203) { snprintf(err, errn, "not SPIR-V"); return NULL; }
+    uint32_t ent[8]; int nent = 0; size_t after = 0;
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = w[i] & 0xffff, ln = w[i] >> 16;
+        if (!ln || i + ln > nw) { snprintf(err, errn, "bad instruction at word %zu", i); return NULL; }
+        if (op == OpEntryPoint && ln >= 3 && w[i + 1] == ModelFragment && nent < 8) ent[nent++] = w[i + 2];
+        if (op == OpEntryPoint || op == OpExecutionMode || op == OpExecutionModeId) after = i + ln;
+        else if (after) break;   // (the execution modes come right after the entry points)
+        if (op == OpExecutionMode && ln >= 3 && w[i + 2] == ModeEarlyTests) { snprintf(err, errn, "already has EarlyFragmentTests"); return NULL; }
+        i += ln;
+    }
+    if (!nent || !after) { snprintf(err, errn, "no fragment entry point"); return NULL; }
+    vec_t o = {0};
+    if (!put_n(&o, w, after)) goto nomem;
+    for (int k = 0; k < nent; k++) { uint32_t m[3] = {3u << 16 | OpExecutionMode, ent[k], ModeEarlyTests}; if (!put_n(&o, m, 3)) goto nomem; }
+    if (!put_n(&o, w + after, nw - after)) goto nomem;
+    *out_nw = o.n; return o.w;
+nomem:
+    free(o.w); snprintf(err, errn, "no memory"); return NULL;
 }

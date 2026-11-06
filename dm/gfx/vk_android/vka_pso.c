@@ -308,6 +308,7 @@ static int pstate_fill(pstate *P, vka_shader *const sh[VKA_NSTAGE], const vka_la
         VkShaderModule mod = memu0 ? vka_shader_module(s, DMSH_VK_MOD_MESH_EMU_VS)
                            : order[i] == 0 && (k->vin_u | k->vin_s) ? vka_shader_vin_module(s, k->vin_u, k->vin_s) : order[i] == 2 && k->gs_fx ? vka_shader_gs_module(s)
                            : fs && fsv == VKA_FS_RETYPE ? (fu | fsm ? vka_shader_fout_module(s, fu, fsm) : vka_shader_module(s, DMSH_VK_MOD_BASE))
+                           : fs && fsv == DMSH_VK_MOD_BASE && !P->afunc && vka_shader_early_module(s) ? vka_shader_early_module(s)   // marked, no alpha test: early depth tests kept
                            : vka_shader_module(s, fs ? fsv : DMSH_VK_MOD_BASE);
         if (!mod && order[i] == 2 && k->gs_fx) mod = vka_shader_module(s, DMSH_VK_MOD_BASE);   // no module with the claim (logged): the shader as it is
         if (!mod) return 0;

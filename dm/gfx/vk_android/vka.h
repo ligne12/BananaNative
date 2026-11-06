@@ -88,6 +88,7 @@ typedef struct {
     // and their draws skipped. mesh_inv / task_inv: the largest workgroup (maxMeshWorkGroupInvocations / maxTaskWorkGroupInvocations); mesh_out_v / mesh_out_p: the most vertices /
     // primitives a mesh workgroup may output; task_payload: maxTaskPayloadSize; task_groups / mesh_groups: maxTaskWorkGroupCount[0] / maxMeshWorkGroupCount[0] (a draw's count)
     int membudget;   // VK_EXT_memory_budget: the driver's heap usage in ctl "stats" (vka_heap_usage)
+    int frag_atomics, vert_atomics;   // fragmentStoresAndAtomics, vertexPipelineStoresAndAtomics (the pool read marks, vka_tex.c)
     int pstats;   // DM_VK_PSTATS: VK_KHR_pipeline_executable_properties enabled (vka_pso.c pstats)
     int mesh, task; uint32_t mesh_inv, task_inv, mesh_out_v, mesh_out_p, task_payload, task_groups, mesh_groups;
     int gpl;                                        // graphics pipeline libraries with fast linking (VK_EXT_graphics_pipeline_library): a pipeline the cache lacks is linked from stage libraries at once, the optimized one made in the background (vka_pso.c)
@@ -161,6 +162,9 @@ VkCommandBuffer vka_rp_cb(void);                    // the replay's command buff
 // went in a game that the system stops before its first frame (Mario Kart World 1.8.0 on a 16 GB phone). Values read without the owners' locks (a log line, called under them)
 void vka_mem_grew(uint64_t bytes);
 uint64_t vka_scratch_bytes(uint32_t *blocks);
+int vka_pool_mark_binding(void);
+struct vka_shader;
+VkShaderModule vka_shader_early_module(struct vka_shader *s);   // a marked pixel shader's module with early depth tests, for a pipeline without the alpha test (VK_NULL_HANDLE: none)                    // the pool set's binding of the read bitmap shaders mark (vka_tex.c), -1: no marks
 void vka_tex_objects(int reap, char *b, size_t n);   // texture objects dropped without a Finalize: counted (b), released with reap (DM_VK_TEX_REAP)
 void vka_nan_live(void);                            // DM_VK_NANSCAN_HOLD read again (at a submission's end)
 void vka_ctl_stats_soon(void);                      // ctl "stats" at the next frame
@@ -324,6 +328,7 @@ typedef struct vka_shader {
     int bad;                            // refused: no module, an unknown binding, an NV-only capability (logged once with its key)
     int gs_fx;                          // a geometry shader's memory writes (vka_spv_gs_claim): above 0, its draws bind a claim buffer at VKA_GS_CLAIM_BINDING
     VkShaderModule gs_claim;            // its module with those writes under the per-primitive claim, made when a pipeline first asks
+    VkShaderModule early; _Atomic int early_state;   // a marked pixel shader's module with EarlyFragmentTests (vka_shader_early_module): 1 made, -1 none, 0 not asked yet
 } vka_shader;
 typedef struct { vka_shader *sh[VKA_NSTAGE]; unsigned bad; } vka_progsh;   // by NVN stage; bad: stages whose shader is refused (bit = NVN stage) or VKA_BAD_MISSING (their draws are skipped)
 #define VKA_BAD_MISSING (1u << VKA_NSTAGE)   // vka_progsh.bad: a stage's shader is not in the library (its NVN stage unknown)
@@ -435,11 +440,11 @@ void vka_tex_watch_dispatch(uint64_t key);         // DM_VK_NANSCAN: compute sha
 void vka_nan_draw(uint64_t vs, uint64_t fs);
 void vka_nan_pass(VkCommandBuffer cb, vka_img *const *ims, const uint32_t *lvs, const uint32_t *l0s, int n);
 void vka_nan_commit(uint64_t fence);
-void vka_draw_stats(uint64_t *draws, uint64_t *skipped, uint64_t *dispatches, uint64_t *pipelines);
-
 int vka_rtdump_on(void);                            // DM_VK_RTDUMP: the colour targets of every pass of the next n frames, as thumbnails (vka_rtdump.c)
 void vka_rtdump_draw(uint64_t vs, uint64_t fs);
 void vka_rtdump_pass(VkCommandBuffer cb, vka_img *const *ims, const uint32_t *lvs, const uint32_t *l0s, int n);
+void vka_draw_stats(uint64_t *draws, uint64_t *skipped, uint64_t *dispatches, uint64_t *pipelines);
+
 // ---------- Present (vka_present.c) ----------
 int vka_origin_ll(void);
 int vka_queue_origin_ll(void);   // the submitting queue's raster origin (nvnQueueBuilder flags): the winding flips with it
