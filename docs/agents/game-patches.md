@@ -101,7 +101,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 | [Taiko Risshiden V DX](#taiko-risshiden-v-dx) | 1 | 0 | 0 | 2 | 0 | `game` |
 | [The Legend of Zelda: Breath of the Wild](#the-legend-of-zelda-breath-of-the-wild) | 7 | 0 | 5 | 0 | 0 | `build` → `game` ×2 |
 | [The Legend of Zelda: Link's Awakening](#the-legend-of-zelda-links-awakening) | 1 | 0 | 0 | 0 | 0 | `build` → `game` |
-| [The Legend of Zelda: Ocarina of Time](#the-legend-of-zelda-ocarina-of-time) | 5 | 20 | 0 | 0 | 0 | `build` → `engine` ×2 |
+| [The Legend of Zelda: Ocarina of Time](#the-legend-of-zelda-ocarina-of-time) | 5 | 0 | 0 | 0 | 0 | `build` → `engine` ×2 |
 | [The Legend of Zelda: Tears of the Kingdom](#the-legend-of-zelda-tears-of-the-kingdom) | 0 | 0 | 9 | 0 | 0 | `build` → `game` |
 | [Xenoblade Chronicles 3](#xenoblade-chronicles-3) | 6 | 0 | 0 | 0 | 0 | `build` → `game` |
 
@@ -558,26 +558,6 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
   - cut `+0x25aad0`: upscale step: ldrb w12, [x12, #0x9c0] (use NDSR) → mov w12, #0
   - cut `+0x534e18`: renderer: ldrb w8, [x8, #0x9c0] (use NDSR) → mov w8, #0
   - cut `+0x654f04`: renderer: ldrb w10, [x10, #0x9c0] (use NDSR) → mov w10, #0
-  - gate 283 at `+0x2d1380`: trace 1: pane update entry (x0 the pane)
-  - gate 539 at `+0x2d2808`: trace 2: pane update, the pane has a text request object (x8; [x8] its pending word)
-  - gate 795 at `+0x2d2818`: trace 3: pane update sends the request to UpdateTextBoxTextureThread
-  - gate 1051 at `+0xa7f3c0`: trace 4: eui::FontMgr font by name (x1 the name)
-  - gate 1307 at `+0xa7e9c0`: trace 5: eui::FontMgr font resource load (x1 its description)
-  - gate 1563 at `+0x439ac0`: trace 6: a text box registers with the texture thread (x0 the text box)
-  - gate 1819 at `+0x439aec`: trace 7: its layout has an owner ([+0xb0] set, x8)
-  - gate 2075 at `+0x439b94`: trace 8: the text request (+0x278) is made
-  - gate 2331 at `+0x2d278c`: trace 9: pane update reaches the request test before the send
-  - gate 2587 at `+0x772034`: trace 10: a layout root is bound to its owner (x0 the owner, x8 its vtable, x21 the root)
-  - gate 2843 at `+0x4b6110`: trace 11: a pane object is activated (x0 the object, w1 the level, x8 its old +0x1a5)
-  - gate 3099 at `+0x5392e0`: trace 12: the update loop reaches an object whose state is set (x0 the object, x8 its id, x22 the position)
-  - gate 3355 at `+0x5392ec`: trace 13: the update loop calls the object update (x0 the object, x8 its vtable)
-  - gate 3611 at `+0x773a00`: trace 14: a pane makes its root layout holder (x0 the pane, x1 its heap, lr the caller)
-  - gate 3867 at `+0x74d7b0`: trace 15: a flow node is entered (x0 the node, lr the caller)
-  - gate 4123 at `+0xc66478`: trace 16: an open-by-name request resolved its pane (x0 the id found, x19 the request)
-  - gate 4379 at `+0x150b670`: trace 17: a text box is calculated (x0 the text box, lr the caller)
-  - gate 4635 at `+0xe4e100`: trace 18: a text box builds its glyphs (x0 the text box; lr main+0x150b74c on the frame, main+0xe4e0a0 on the texture thread)
-  - gate 4891 at `+0xe4e22c`: trace 19: a text box has no font (+0xe8 null): no glyphs (x8 its state word)
-  - gate 5147 at `+0xe4e110`: trace 20: a text box has its font and goes on (x0 the text box)
 
 ### The Legend of Zelda: Tears of the Kingdom
 

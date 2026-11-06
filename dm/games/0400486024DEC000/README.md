@@ -1,6 +1,6 @@
 # The Legend of Zelda: Ocarina of Time (`0400486024DEC000`)
 
-A Switch 2 game: version v131072 (the update `0400486024DEC800` over the base v65536), from a `.nup`. SDK 22.2.8 built for the Switch 2 (`sdk` names its spec `Ounce`), NVN2. Nintendo EPD's engine (sead / agl / gsys, Phive) with the RomFS layout of [Tears of the Kingdom](../0100F2C0115B6000/README.md) (`Banc`, `Chemical`, `Mals`, `RSDB`, `ActorSystem`, `Pack/*.pack.zs`). **In bring-up: not started on any device yet.**
+A Switch 2 game: version v131072 (the update `0400486024DEC800` over the base v65536), from a `.nup`. SDK 22.2.8 built for the Switch 2 (`sdk` names its spec `Ounce`), NVN2. Nintendo EPD's engine (sead / agl / gsys, Phive) with the RomFS layout of [Tears of the Kingdom](../0100F2C0115B6000/README.md) (`Banc`, `Chemical`, `Mals`, `RSDB`, `ActorSystem`, `Pack/*.pack.zs`). **In bring-up on Android (AYN Thor, Turnip): the title menu runs at 60 frames a second with its text, the 3D scene at about 15.**
 
 ## What it needs
 
@@ -15,7 +15,7 @@ A Switch 2 game: version v131072 (the update `0400486024DEC800` over the base v6
 
 | Version | Display | Modules (build IDs) | Status |
 |---|---|---|---|
-| `v131072` | not known | main `e0f3ccfaf50065ae4ea01eb5aeb13b1a`, subsdk0 `b0110087a7b339ef74588d3bd0b4dd5d` (movie), sdk `1643a838814f9c10c696f930ed681e7f` (nnSdk 22.2.8) | registered (`build v131072`); rewritten for Android, one cut ([`patches.py`](patches.py)) |
+| `v131072` | not known | main `e0f3ccfaf50065ae4ea01eb5aeb13b1a`, subsdk0 `b0110087a7b339ef74588d3bd0b4dd5d` (movie), sdk `1643a838814f9c10c696f930ed681e7f` (nnSdk 22.2.8) | registered (`build v131072`); rewritten for Android, two cuts ([`patches.py`](patches.py)) |
 
 Every module is ZBIC-compressed (NSO flag bit 7): reading them takes the `zbic` package ([ZBIC-compressed NSO segments](../../../docs/reference/packing.md#zbic-compressed-nso-segments)).
 
@@ -54,16 +54,25 @@ Every module is ZBIC-compressed (NSO flag bit 7): reading them takes the `zbic` 
   - What still costs: vertex shader `4671e5e647fc5455` (2 draws, 87,576 indices) reads memory through a pointer 253 times a vertex. Its pass takes about 20 ms. Turnip's statistics (`DM_VK_PSTATS`) put the shader at 18,008 instructions with the page table, against 50,769 with the search.
   - Measured with `DM_VK_GPUPROF`, `DM_VK_DRAW_SKIP` and `DM_VK_XP_SCISSOR`: the pass is bound by its vertices, not its pixels.
   - Keeping the last page looked up per invocation made it no faster (22 ms). The memory loads themselves are the likely cost; reading through bound storage buffers instead is not tried yet.
+- **Resolved:** the title menu had no text; its panels drew. The shader translator lost the corner's y in the glyph vertex shader `b19e1bdd247555ec`, so every glyph quad was flat ([Ampere deferred writes lost at a guarded last instruction](../../../docs/reference/shaders.md#ampere-deferred-writes-lost-at-a-guarded-last-instruction)). The title and Options menus show all their text at 60 frames a second (2026-11-06).
+  - How the game draws text: each text box is rendered once into a texture of its own (a capture pane caches it; the glyph pages are R8 linear, filled by the CPU at `main+0x1519300`), and the frame composites that texture. So the boxes' draws happen once, and a frame's draws hold no glyphs.
+  - The path was found with temporary observation gates on the panes' update, the text boxes' glyph build (`main+0xe4e0e0`) and draw (`main+0x153cd80`): every step ran. Then `DM_VK_NANSCAN_GPUDUMP` read the box textures back (empty) and counted no sample for any glyph draw, and the vertex shader run on the CPU with the draw's inputs (`DM_VK_KEYDUMP_FULL`) gave every corner the same y. The gates are gone.
 
 ## Open
 
 - The picture on Android with the movie and NDSR cuts: the 3D scene renders at about 15 fps (see above), and the mesh draws Turnip cannot run are open (`DrawMeshTasksIndirect`, no `VK_EXT_mesh_shader`).
-- The title menu's text is missing; its panels draw. Findings so far:
-  - The text box under the logo is pixel shader `b998f78a92860333`. Its four RGTC1 textures are only the band's decoration (`DM_VK_TEXDUMP`).
-  - No draw of the title screen holds glyphs, and the host skips none: the game emits no text.
-  - The scalable fonts (`Font2/Scalable/*.bfotf`) and the English messages (`Mals/USen.Product.110.sarc`) load (`DM_FS`). `tex_flush_upload` and `tex_dirty_upload` change nothing.
-  - The texture text thread (`eui::FontMgr` + 0x118) only serves explicitly registered boxes (the button guide's icons), which the title does not open.
-  - The title's text boxes are calculated each frame (`main+0x150b670`), build their glyphs on the frame (`main+0xe4e0e0`) and have their font (`+0xe8` set): what stops is further on. Either the font's glyph texture pages (its vtable slots `+0xe0`, `+0xa8`, `+0xc8`) or the text box's draw.
-  - The observation gates in [`patches.py`](patches.py) are temporary. Where the byte at `main+0x4e95f61` is set (a setting, or a debug switch) is not looked at.
+- Where the byte at `main+0x4e95f61` (the movie renderer's plain path) is set, a setting or a debug switch, is not looked at.
 - The memory layout is not measured (see above).
 - The translator changes move the chain version for every game: they need `scripts/regress.py check` on a Mac before they can go upstream.
+
+## Found on this game
+
+General changes first needed here; each applies to every game:
+
+- **Deferred writes kept at a guarded last instruction** (`Translator.EmitOpsAmpere`, `ShadowFixedWrites`): [Ampere deferred writes lost at a guarded last instruction](../../../docs/reference/shaders.md#ampere-deferred-writes-lost-at-a-guarded-last-instruction).
+- **A probed draw read back from the GPU, with occlusion and pipeline-statistics queries** (`DM_VK_NANSCAN_GPUDUMP`, `vka_nanscan.c`) and **a draw's inputs written whole** (`DM_VK_KEYDUMP_FULL`, `vka_draw.c`): [android/TESTING.md](../../../android/TESTING.md).
+- **Pointer authentication keys per thread on Android**: [Pointer authentication keys differ per thread on Android](../../../docs/reference/threads.md#pointer-authentication-keys-differ-per-thread-on-android).
+- **AV1 through MediaCodec**: [AV1 on Android through MediaCodec](../../../docs/reference/movies.md#av1-on-android-through-mediacodec).
+- **SDK 22.2's audio renderer update lock**: [The renderer's update lock](../../../docs/reference/audio.md#the-renderers-update-lock-update_lock).
+- **`prepo::PlayReport::Send(Uid)`'s async context**: [An async context returned through x8](../../../docs/reference/services.md#an-async-context-returned-through-x8-prepoplayreportsend).
+- **Raw global memory through a page table on Android**: [Global memory at an address loaded from memory](../../../docs/reference/shaders.md#global-memory-at-an-address-loaded-from-memory).

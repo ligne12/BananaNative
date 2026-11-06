@@ -20,38 +20,6 @@ CUTS = {
   ],
 }
 
-# Temporary observation gates (OBS_TRACE = 27, the trace point in bits 8 up; hle.c obs_trace logs the registers): why the title menu draws its text boxes' panels but no text.
-# The text boxes' texture thread (UpdateTextBoxTextureThread, eui::FontMgr + 0x118) never received a message; a pane's update (vtable method main+0x2d1380, shared by the pane classes)
-# sends one only when the pane has a request object (+0x278) whose first word is set. Remove once the cause is known
-OBS = {
-  'e0f3ccfaf50065ae4ea01eb5aeb13b1a': [
-    (0x2d1380, 27 | 1 << 8, 'd503237f', 'trace 1: pane update entry (x0 the pane)'),
-    (0x2d2808, 27 | 2 << 8, 'b9400109', 'trace 2: pane update, the pane has a text request object (x8; [x8] its pending word)'),
-    (0x2d2818, 27 | 3 << 8, 'f9401268', 'trace 3: pane update sends the request to UpdateTextBoxTextureThread'),
-    (0xa7f3c0, 27 | 4 << 8, 'd503237f', 'trace 4: eui::FontMgr font by name (x1 the name)'),
-    (0xa7e9c0, 27 | 5 << 8, 'd503237f', 'trace 5: eui::FontMgr font resource load (x1 its description)'),
-    # The only maker of the request object (+0x278) is main+0x439ac0 (x0 a text box): it returns at once when [[box+0x18]+0xb0] (its layout's owner) is null
-    (0x439ac0, 27 | 6 << 8, 'd503237f', 'trace 6: a text box registers with the texture thread (x0 the text box)'),
-    (0x439aec, 27 | 7 << 8, 'f9401516', 'trace 7: its layout has an owner ([+0xb0] set, x8)'),
-    (0x439b94, 27 | 8 << 8, 'f9013ed5', 'trace 8: the text request (+0x278) is made'),
-    (0x2d278c, 27 | 9 << 8, 'f9413e68', 'trace 9: pane update reaches the request test before the send'),
-    # The request lands on the layout's owner (L+0x28), which the update loop main+0x5391e0 never updates (it updates two other panes): why
-    (0x772034, 27 | 10 << 8, 'f9416508', 'trace 10: a layout root is bound to its owner (x0 the owner, x8 its vtable, x21 the root)'),
-    (0x4b6110, 27 | 11 << 8, 'f9401008', 'trace 11: a pane object is activated (x0 the object, w1 the level, x8 its old +0x1a5)'),
-    (0x5392e0, 27 | 12 << 8, '79436008', 'trace 12: the update loop reaches an object whose state is set (x0 the object, x8 its id, x22 the position)'),
-    (0x5392ec, 27 | 13 << 8, 'f9404508', 'trace 13: the update loop calls the object update (x0 the object, x8 its vtable)'),
-    # The owner is never activated (trace 11): panes are activated by a UI flow graph's node entry (main+0x74d7b0) or by an open-by-name request (main+0xc66420)
-    (0x773a00, 27 | 14 << 8, 'd503237f', 'trace 14: a pane makes its root layout holder (x0 the pane, x1 its heap, lr the caller)'),
-    (0x74d7b0, 27 | 15 << 8, 'd503237f', 'trace 15: a flow node is entered (x0 the node, lr the caller)'),
-    (0xc66478, 27 | 16 << 8, 'f868d920', 'trace 16: an open-by-name request resolved its pane (x0 the id found, x19 the request)'),
-    # The title emits no glyph draw: where a text box's calculation stops (main+0x150b670 each frame; main+0xe4e0e0 builds its glyphs from its font at +0xe8)
-    (0x150b670, 27 | 17 << 8, 'd503237f', 'trace 17: a text box is calculated (x0 the text box, lr the caller)'),
-    (0xe4e100, 27 | 18 << 8, 'f9407409', 'trace 18: a text box builds its glyphs (x0 the text box; lr main+0x150b74c on the frame, main+0xe4e0a0 on the texture thread)'),
-    (0xe4e22c, 27 | 19 << 8, 'b9400109', 'trace 19: a text box has no font (+0xe8 null): no glyphs (x8 its state word)'),
-    (0xe4e110, 27 | 20 << 8, 'aa0203f4', 'trace 20: a text box has its font and goes on (x0 the text box)'),
-  ],
-}
-
 # How general each patch is and could be (dm/tools/docs_patches.py "Binding", listed in docs/agents/game-patches.md): what, its binding now, the loosest it could have (goal),
 # purpose, why; blocked or kept: why the gap stays open (cannot close yet, or left open on purpose); checked: what was checked on game files (else a judgement)
 BINDING = [
