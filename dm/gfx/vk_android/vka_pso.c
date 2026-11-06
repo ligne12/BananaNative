@@ -58,6 +58,13 @@ static VkShaderStageFlags stage_bit(int vks) {
                                             VK_SHADER_STAGE_GEOMETRY_BIT, VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_STAGE_COMPUTE_BIT, VK_SHADER_STAGE_TASK_BIT_EXT, VK_SHADER_STAGE_MESH_BIT_EXT};
     return vks >= 0 && vks < 8 ? b[vks] : 0;
 }
+// A task / mesh entry on a device without VK_EXT_mesh_shader runs emulated (vka_draw.c memu_run): as compute in slots 5-7 (its NVN stage's bindings read in 6 / 7), as the
+// vertex shader of its mesh output in slot 0; a compute layout then takes slots 6 and 7 as well
+static VkShaderStageFlags slot_bit(const vka_shader *s, int slot) {
+    if (!V.mesh && (s->e->stage == DMSH_VK_STAGE_TS || s->e->stage == DMSH_VK_STAGE_MS)) return slot == 0 ? VK_SHADER_STAGE_VERTEX_BIT : VK_SHADER_STAGE_COMPUTE_BIT;
+    return stage_bit(s->e->stage);
+}
+static int in_layout(int slot, int compute) { return compute ? slot == 5 || (!V.mesh && (slot == 6 || slot == 7)) : slot != 5; }
 enum { MAXB = 6 * DMSH_VK_STAGE_BINDINGS };   // (task and mesh shaders take the tess control and vertex ranges: dmsh_abi_vk.h)
 typedef struct { uint32_t n; struct { uint16_t binding; uint8_t desc, pad; uint16_t count; uint16_t stages; } b[MAXB]; } lkey;
 static kmap g_layouts = {.klen = sizeof(lkey)};
@@ -69,7 +76,7 @@ static kmap g_lshort = {.klen = sizeof(skey)};
 static int layout_slow(vka_shader *const sh[VKA_NSTAGE], int compute, vka_layout *out);
 int vka_layout_of(vka_shader *const sh[VKA_NSTAGE], int compute, vka_layout *out) {
     skey sk; memset(&sk, 0, sizeof sk);
-    for (int st = 0; st < VKA_NSTAGE; st++) if ((st == 5) == (compute != 0)) sk.sh[st] = sh[st];
+    for (int st = 0; st < VKA_NSTAGE; st++) if (in_layout(st, compute)) sk.sh[st] = sh[st];
     sk.compute = compute != 0;
     uint64_t h = fnv(&sk, sizeof sk, 1469598103934665603ull);
     pthread_mutex_lock(&g_mu);
@@ -89,16 +96,16 @@ static int layout_slow(vka_shader *const sh[VKA_NSTAGE], int compute, vka_layout
     uint32_t ndesc = 0;
     for (int st = 0; st < VKA_NSTAGE; st++) {
         const vka_shader *s = sh[st];
-        if (!s || (st == 5) != (compute != 0)) continue;
+        if (!s || !in_layout(st, compute)) continue;
         for (unsigned i = 0; i < s->e->bind_count; i++) {
             const dmsh_vk_bind *b = &s->b[i];
             if (b->set != DMSH_VK_SET_DRAW || b->kind == DMSH_VK_KIND_TEX_POOL || b->kind == DMSH_VK_KIND_SAMP_POOL) continue;
             if (k.n == MAXB) { VRED_ONCE("more than %d set-0 bindings in one pipeline", MAXB); return 0; }
-            k.b[k.n].binding = b->binding; k.b[k.n].desc = b->desc; k.b[k.n].count = b->count ? b->count : 1; k.b[k.n].stages = (uint16_t)stage_bit(s->e->stage);
+            k.b[k.n].binding = b->binding; k.b[k.n].desc = b->desc; k.b[k.n].count = b->count ? b->count : 1; k.b[k.n].stages = (uint16_t)slot_bit(s, st);
             ndesc += k.b[k.n].count; k.n++;
         }
         if (s->gs_fx > 0 && k.n < MAXB) {   // the claim words of a geometry shader that writes memory (vka_spv_gs_claim)
-            k.b[k.n].binding = VKA_GS_CLAIM_BINDING; k.b[k.n].desc = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; k.b[k.n].count = 1; k.b[k.n].stages = (uint16_t)stage_bit(s->e->stage); ndesc++; k.n++;
+            k.b[k.n].binding = VKA_GS_CLAIM_BINDING; k.b[k.n].desc = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; k.b[k.n].count = 1; k.b[k.n].stages = (uint16_t)slot_bit(s, st); ndesc++; k.n++;
         }
     }
     // Sorted by binding, so the same set of records gives the same key whatever the order of stages
@@ -296,16 +303,18 @@ static int pstate_fill(pstate *P, vka_shader *const sh[VKA_NSTAGE], const vka_la
     for (int i = 0; i < nord; i++) {
         vka_shader *s = sh[order[i]]; if (!s) continue;
         int fs = order[i] == 1, gl = k->gl_depth && order[i] == last_pre && (s->e->flags & DMSH_VK_F_GL_DEPTH);
-        uint32_t fu = 0, fsm = 0; if (fs && k->fs_variant == VKA_FS_RETYPE) fout_masks(s, k, &fu, &fsm);
-        VkShaderModule mod = order[i] == 0 && (k->vin_u | k->vin_s) ? vka_shader_vin_module(s, k->vin_u, k->vin_s) : order[i] == 2 && k->gs_fx ? vka_shader_gs_module(s)
-                           : fs && k->fs_variant == VKA_FS_RETYPE ? (fu | fsm ? vka_shader_fout_module(s, fu, fsm) : vka_shader_module(s, DMSH_VK_MOD_BASE))
-                           : vka_shader_module(s, fs ? k->fs_variant : DMSH_VK_MOD_BASE);
+        int memu0 = order[i] == 0 && (k->fs_variant & VKA_KEY_MESH_EMU), fsv = k->fs_variant & ~VKA_KEY_MESH_EMU;   // (an emulated mesh draw's vertex stage: VKA_KEY_MESH_EMU)
+        uint32_t fu = 0, fsm = 0; if (fs && fsv == VKA_FS_RETYPE) fout_masks(s, k, &fu, &fsm);
+        VkShaderModule mod = memu0 ? vka_shader_module(s, DMSH_VK_MOD_MESH_EMU_VS)
+                           : order[i] == 0 && (k->vin_u | k->vin_s) ? vka_shader_vin_module(s, k->vin_u, k->vin_s) : order[i] == 2 && k->gs_fx ? vka_shader_gs_module(s)
+                           : fs && fsv == VKA_FS_RETYPE ? (fu | fsm ? vka_shader_fout_module(s, fu, fsm) : vka_shader_module(s, DMSH_VK_MOD_BASE))
+                           : vka_shader_module(s, fs ? fsv : DMSH_VK_MOD_BASE);
         if (!mod && order[i] == 2 && k->gs_fx) mod = vka_shader_module(s, DMSH_VK_MOD_BASE);   // no module with the claim (logged): the shader as it is
         if (!mod) return 0;
         uint32_t n = P->ns++;
-        P->ss[n] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = (VkShaderStageFlagBits)stage_bit(s->e->stage), .module = mod, .pName = "main",
+        P->ss[n] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = (VkShaderStageFlagBits)slot_bit(s, order[i]), .module = mod, .pName = "main",
                                                     .pSpecializationInfo = gl ? &P->spec : fs && P->afunc && (s->e->flags & DMSH_VK_F_ALPHA_TEST) ? &P->aspec : NULL};
-        uint32_t pin = (s->e->flags & DMSH_VK_F_SUBGROUP) ? vka_shader_sg_pin(s->e->stage) : 0;   // subgroup shaders of a stage whose size the device varies: pinned to the library's (vka_shader_sg_pin)
+        uint32_t pin = (s->e->flags & DMSH_VK_F_SUBGROUP) && !memu0 ? vka_shader_sg_pin(s->e->stage) : 0;   // subgroup shaders of a stage whose size the device varies: pinned to the library's (vka_shader_sg_pin)
         if (pin) { P->rsg[n] = (VkPipelineShaderStageRequiredSubgroupSizeCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO, .requiredSubgroupSize = pin};
                    P->ss[n].pNext = &P->rsg[n]; }
     }

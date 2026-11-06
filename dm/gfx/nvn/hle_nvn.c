@@ -1134,6 +1134,9 @@ static void rec_draw_idx(NVNcommandBuffer *c, p_draw_idx d) { size_t n = d.ind |
 // others (it opens and joins render passes the same way); the Vulkan replay draws it with vkCmdDrawMeshTasksEXT (vka_draw.c). The signature is the game's calls' (switch2mac
 // hle_nvn.c, MIT: x1 = 0, x2 = workgroups in Mario Kart World). The indirect, 3D and multi-draw variants keep the unimplemented stub (a red line when one is called)
 NVN_NOPROTO(nvnCommandBufferDrawMeshTasks, void, NVNcommandBuffer *c, int first, int count) { rec_draw(c, (p_draw){NVN_PRIM_MESH, first, count, 1, 0, 0}); }
+// The indirect form: the GPU address of {count, first} (the order of NV_mesh_shader's DrawMeshTasksIndirectCommandNV, as the direct form's arguments; The Legend of Zelda:
+// Ocarina of Time's agl meshlet draws, main+0x2be3470 / main+0x2be39c0, pass the command buffer and that address). Drawn emulated only (vka_draw.c memu_run)
+NVN_NOPROTO(nvnCommandBufferDrawMeshTasksIndirect, void, NVNcommandBuffer *c, uint64_t ind) { rec_draw(c, (p_draw){NVN_PRIM_MESH, 0, 0, 1, 0, ind}); }
 #endif
 static void copy_view(view_t *dst, uint8_t *has, const NVNtextureView *v) { *has = v != NULL; if (v) *dst = *(const view_t *)v; }
 // Records with textures snapshot the texture objects (0x80 bytes each, after the record struct) and replay reads the snapshots: an NVN command no longer depends on the API object once recorded, and the game may finalize, free or reuse it before submitting.

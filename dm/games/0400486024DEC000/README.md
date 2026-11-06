@@ -61,7 +61,7 @@ Every module is ZBIC-compressed (NSO flag bit 7): reading them takes the `zbic` 
 ## Open
 
 - The picture on Android with the movie and NDSR cuts:
-  - The mesh draws are missing: the host does not implement `nvnCommandBufferDrawMeshTasksIndirect` (a red stub), and Turnip has no `VK_EXT_mesh_shader` for `DrawMeshTasks`. The terrain around the Great Deku Tree has holes where the sky shows through, which the exposure and the bloom turn into white patches that move with the camera.
+  - The mesh draws (agl's meshlets: task `efaa4fa6a80ba719` and five mesh programs, among 12) are emulated as compute, and the stream of the Great Deku Tree's clearing draws again ([NVN2 mesh draws without VK_EXT_mesh_shader](../../../docs/reference/shaders.md#nvn2-mesh-draws-without-vk_ext_mesh_shader)). Still open: the cost of ending the render pass at each of them; one run killed by the system for low memory after 2.5 s, not seen again; wrong pictures here and there.
   - A white haze over the Great Deku Tree's clearing. Skipping the fog draw (fragment shader `888c1068ac8f7043`, agl's `AglShader.sharcb`) clears it, but the HDR target after that draw holds a moderate haze (`DM_VK_NANSCAN_GPUDUMP`); the scene is very bright without it too, so the exposure is the suspect (a 128x128 to 1x1 chain of passes, not looked at yet).
   - The game waits for the GPU each frame: the frame is about the GPU time plus 20 ms of CPU.
 - Where the byte at `main+0x4e95f61` (the movie renderer's plain path) is set, a setting or a debug switch, is not looked at.

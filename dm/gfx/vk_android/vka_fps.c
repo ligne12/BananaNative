@@ -1,6 +1,7 @@
 // The frame rate the launcher's overlay shows (nxhost_fps, vk_android.h): the present thread counts each image it hands to the swapchain (vka_fps_note), the game's own
 // frames apart from frames the frame generation made (vka_framegen.c), and publishes the counts once a second. Nothing is drawn here: the launcher reads the numbers through JNI
-// and draws them in an Android view over the SurfaceView, so the counter costs no GPU work. The log gets the same numbers every 15 s ("[vk] fps: ...")
+// and draws them in an Android view over the SurfaceView, so the counter costs no GPU work. The log gets the same numbers every 15 s ("[vk] fps: ..."), or every
+// DM_VK_FPS_LOG_MS (live) with the GPU time a frame the overlay shows: what a probe measures a change by (Zelda/sonde/sonde_cout.sh)
 #if defined(__ANDROID__)
 #include "vka.h"
 #include "vk_android.h"
@@ -9,6 +10,8 @@ static uint64_t g_win_t0, g_base_n, g_out_n, g_base_ns_sum, g_last_base, g_log_t
 static _Atomic uint32_t g_pub_base, g_pub_out, g_pub_ft;   // published: fps x 100, fps x 100, frame time in µs
 static _Atomic uint64_t g_pub_t;                          // when they were published (now_ns)
 static _Atomic int g_fg_state, g_fg_mult;                 // frame generation: 0 off, 1 generating, 2 on but not generating (warming up, paced out), -1 unavailable; frames per game frame
+
+static float gpu_ms(void);
 
 void vka_fps_fg(int state, int mult) { atomic_store(&g_fg_state, state); atomic_store(&g_fg_mult, mult); }
 
@@ -28,11 +31,13 @@ void vka_fps_note(int shown, int generated) {
     atomic_store(&g_pub_out, (uint32_t)(g_out_n / s * 100 + 0.5));
     atomic_store(&g_pub_ft, g_base_n ? (uint32_t)(g_base_ns_sum / g_base_n / 1000) : 0);
     atomic_store(&g_pub_t, t);
-    if (t - g_log_t >= 15000000000ull) {
+    int period = VKA_ENV("DM_VK_FPS_LOG_MS", 15000);
+    if (t - g_log_t >= (uint64_t)(period > 0 ? period : 15000) * 1000000ull) {
         g_log_t = t;
         int st = atomic_load(&g_fg_state);
-        VLOG("fps: %.1f game frames a second (%.1f ms), %.1f presented%s", g_base_n / s, g_base_n ? g_base_ns_sum / g_base_n / 1e6 : 0.0, g_out_n / s,
-             st == 1 ? " (frame generation on)" : st == 2 ? " (frame generation on, not generating)" : st < 0 ? " (frame generation unavailable)" : "");
+        char gpu[48] = ""; if (period != 15000) snprintf(gpu, sizeof gpu, "; GPU %.1f ms a frame", gpu_ms());
+        VLOG("fps: %.1f game frames a second (%.1f ms), %.1f presented%s%s", g_base_n / s, g_base_n ? g_base_ns_sum / g_base_n / 1e6 : 0.0, g_out_n / s,
+             st == 1 ? " (frame generation on)" : st == 2 ? " (frame generation on, not generating)" : st < 0 ? " (frame generation unavailable)" : "", gpu);
     }
     g_win_t0 = t; g_base_n = g_out_n = g_base_ns_sum = 0;
 }

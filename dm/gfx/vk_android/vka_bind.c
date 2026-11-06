@@ -99,6 +99,7 @@ int vka_walk(const vka_bstate *s, int st, const dmsh_vk_entry *e, const dmsh_vk_
             case DMSH_VK_KIND_SHARED_SPILL:
                 if (!b->bytes || b->bytes % 4) return refuse(why, whyn, "binding %u: shared memory spill of %u bytes a slice", b->binding, b->bytes);
                 r.what = VKA_R_SHARED_SPILL; r.size = b->bytes; break;
+            case DMSH_VK_KIND_MESH_EMU: r.what = VKA_R_MESH_EMU; break;
             default: return refuse(why, whyn, "binding %u: kind %u", b->binding, b->kind);
             }
             if (r.what == VKA_R_BUF && r.desc == 7 /* VK_DESCRIPTOR_TYPE_STORAGE_BUFFER */) {

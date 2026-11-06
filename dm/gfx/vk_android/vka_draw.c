@@ -585,6 +585,8 @@ static int spill_buf(uint32_t slice) {
     }
     return g_spill.buf && g_spill_cap >= slice;
 }
+static struct { VkBuffer buf; VkDeviceMemory mem; VkDeviceSize size; } g_memu;   // the mesh emulation buffer (memu_run, below)
+static int g_memu_on; static VkDeviceSize g_memu_range;
 static void spill_dispatch(uint32_t x, uint32_t y, uint32_t z, uint64_t ns) {
     int first = 1;
     #define PART(bx, by, bz, cx, cy, cz) do { if (!first) vka_barrier(g_cb); first = 0; vk.vkCmdDispatchBase(g_cb, bx, by, bz, cx, cy, cz); } while (0)
@@ -744,6 +746,7 @@ static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const
             case VKA_R_GMEM_MAP: ok = gmem_map(bi); break;
             case VKA_R_GMEM_LOG: ok = gmem_log(bi); break;
             case VKA_R_SHARED_SPILL: ok = st == 5 && g_spill_range && g_spill.buf; if (ok) *bi = (VkDescriptorBufferInfo){g_spill.buf, g_spill.off, g_spill_range}; break;
+            case VKA_R_MESH_EMU: ok = g_memu_on && g_memu.buf; if (ok) *bi = (VkDescriptorBufferInfo){g_memu.buf, 0, g_memu_range}; break;
             default: ok = 0; break;
             }
             if (!ok) { if (V.null_desc) *bi = (VkDescriptorBufferInfo){VK_NULL_HANDLE, 0, VK_WHOLE_SIZE}; else *bi = (VkDescriptorBufferInfo){storage ? g_sink.buf : g_zero.buf, storage ? g_sink.off : g_zero.off, 65536}; }
@@ -1042,6 +1045,135 @@ void vka_draw_prof(char *b, size_t n, double draws) {
     memset(g_ps, 0, sizeof g_ps);
     memset(g_pt, 0, sizeof g_pt);
 }
+// NVN2 mesh draws on a device without VK_EXT_mesh_shader (the AYN Thor's Turnip and Qualcomm drivers): the task program (if any) runs as compute (its DMSH_VK_MOD_MESH_EMU
+// module, Ryujinx SpirvMeshEmuEntry.cs) and writes its payloads and the mesh workgroups it launches into a region of one device buffer; the mesh program runs as compute
+// over those (an indirect dispatch the tasks counted) and writes its vertices' planes and packed primitive indices there; then a triangle (point) list of max primitives x 3
+// vertices a mesh workgroup is drawn indirectly with the mesh entry's DMSH_VK_MOD_MESH_EMU_VS module (SpirvMeshEmuVertex.cs) and the pixel shader (its _FLAT module when it
+// reads per-primitive values). The region's header and layout: dmsh_abi.h DMSH_MESH_EMU_*; the sizes from the binding records (dmsh_abi_vk.h DMSH_VK_KIND_MESH_EMU). One
+// region at the buffer's start for every draw: each emulated draw ends the render pass and its dispatches are fenced by full barriers, so draws do not overlap.
+// DM_VK_MESH_EMU_MB (restart only, default 64) sizes the buffer; a draw launching more mesh workgroups than it holds loses the rest
+static uint32_t g_memu_points;
+static int memu_buf(void) {
+    static int failed; if (g_memu.buf) return 1; if (failed) return 0;
+    failed = 1;
+    const char *e = getenv("DM_VK_MESH_EMU_MB"); VkDeviceSize n = (VkDeviceSize)(e && atoi(e) > 0 ? atoi(e) : 64) << 20;
+    if (V.sb_range && n > V.sb_range) n = V.sb_range & ~(VkDeviceSize)0xffff;
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = n,
+                             .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    if (vk.vkCreateBuffer(V.dev, &bi, NULL, &g_memu.buf)) { g_memu.buf = VK_NULL_HANDLE; VRED("mesh emulation: no buffer of %llu bytes", (unsigned long long)n); return 0; }
+    VkMemoryRequirements mr; vk.vkGetBufferMemoryRequirements(V.dev, g_memu.buf, &mr);
+    uint32_t t = vka_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = t};
+    if (t == UINT32_MAX || vk.vkAllocateMemory(V.dev, &ai, NULL, &g_memu.mem) || vk.vkBindBufferMemory(V.dev, g_memu.buf, g_memu.mem, 0)) {
+        if (g_memu.mem) vk.vkFreeMemory(V.dev, g_memu.mem, NULL);
+        vk.vkDestroyBuffer(V.dev, g_memu.buf, NULL); g_memu.buf = VK_NULL_HANDLE; g_memu.mem = VK_NULL_HANDLE;
+        VRED("mesh emulation: no device memory for its buffer of %llu bytes", (unsigned long long)n); return 0;
+    }
+    g_memu.size = n; failed = 0;
+    VLOG("mesh emulation: a buffer of %llu MiB (draws of task and mesh programs as compute, then an indirect draw; DM_VK_MESH_EMU_MB)", (unsigned long long)(n >> 20));
+    return 1;
+}
+static const dmsh_vk_bind *memu_rec(const vka_shader *s) {
+    for (unsigned i = 0; s && i < s->e->bind_count; i++) if (s->b[i].kind == DMSH_VK_KIND_MESH_EMU) return &s->b[i];
+    return NULL;
+}
+// DM_VK_MESH_EMU_LOG=<n> (live): the next n emulated draws logged (programs, count or indirect, capacity), and each one's region header as the GPU left it after its
+// mesh dispatch (the mesh workgroups the tasks launched, the draw's vertex count, the first workgroup), read back into a host buffer and logged 8 frames later
+static struct { VkBuffer buf; VkDeviceMemory mem; uint32_t *map; } g_memu_rb;
+static uint64_t g_memu_rb_frame[64], g_memu_rb_keys[64][2]; static int g_memu_rb_n, g_memu_logged, g_memu_log_gen = -1;
+static void memu_rb_drain(int all) {
+    uint64_t vka_frame(void);
+    for (int i = 0; i < 64; i++) {
+        if (!g_memu_rb_frame[i] || (!all && g_memu_rb_frame[i] + 8 > vka_frame())) continue;
+        const uint32_t *h = g_memu_rb.map + 16 * i;
+        VLOG("mesh emulation readback (frame %llu, task %016llx mesh %016llx): mesh workgroups launched %u, draw vertex count %u, capacity %u, first %u, has task %u",
+             (unsigned long long)g_memu_rb_frame[i], (unsigned long long)g_memu_rb_keys[i][0], (unsigned long long)g_memu_rb_keys[i][1], h[DMSH_MESH_EMU_DISPATCH],
+             h[DMSH_MESH_EMU_DRAW], h[DMSH_MESH_EMU_CAPACITY], h[DMSH_MESH_EMU_FIRST], h[DMSH_MESH_EMU_HAS_TASK]);
+        g_memu_rb_frame[i] = 0;
+    }
+}
+static int memu_rb_buf(void) {
+    if (g_memu_rb.buf) return 1;
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 64 * 64, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    if (vk.vkCreateBuffer(V.dev, &bi, NULL, &g_memu_rb.buf)) { g_memu_rb.buf = VK_NULL_HANDLE; return 0; }
+    VkMemoryRequirements mr; vk.vkGetBufferMemoryRequirements(V.dev, g_memu_rb.buf, &mr);
+    uint32_t t = vka_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = t};
+    void *p = NULL;
+    if (t == UINT32_MAX || vk.vkAllocateMemory(V.dev, &ai, NULL, &g_memu_rb.mem) || vk.vkBindBufferMemory(V.dev, g_memu_rb.buf, g_memu_rb.mem, 0) || vk.vkMapMemory(V.dev, g_memu_rb.mem, 0, VK_WHOLE_SIZE, 0, &p)) {
+        if (g_memu_rb.mem) vk.vkFreeMemory(V.dev, g_memu_rb.mem, NULL);
+        vk.vkDestroyBuffer(V.dev, g_memu_rb.buf, NULL); g_memu_rb.buf = VK_NULL_HANDLE; g_memu_rb.mem = VK_NULL_HANDLE; return 0;
+    }
+    g_memu_rb.map = p; return 1;
+}
+
+// The dispatches of one emulated mesh draw (sh[6] task or NULL, sh[7] mesh): 0 when it cannot be drawn (logged)
+static int memu_run(vka_dstate *d, const p_draw *dw, vka_shader *const sh[VKA_NSTAGE]) {
+    const dmsh_vk_bind *mb = memu_rec(sh[7]), *tb = sh[6] ? memu_rec(sh[6]) : NULL;
+    if (!mb || (sh[6] && !tb)) { VRED_ONCE("mesh emulation: a task / mesh entry without its region's binding (a library before the emulation)"); return 0; }
+    if (!memu_buf()) return 0;
+    uint64_t maxp = mb->reg, planes = mb->bytes, pw = tb ? tb->off : mb->off;
+    g_memu_points = mb->sreg == 1;
+    // Per mesh workgroup: its (task, rank) pair, planes and packed indices; per task workgroup a payload (task workgroups counted against the same capacity)
+    uint64_t words = g_memu.size / 4, per = 2 + planes + maxp + pw, cap = words > DMSH_MESH_EMU_LIST + 8 ? (words - DMSH_MESH_EMU_LIST - 8) / per : 0;
+    if (cap > 65535) cap = 65535;
+    if (!cap) { VRED_ONCE("mesh emulation: the buffer holds no mesh workgroup"); return 0; }
+    uint64_t count = dw->ind ? 0 : (uint64_t)(dw->count > 0 ? dw->count : 0);
+    if (count > cap) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) VRED("mesh emulation: a draw of %llu workgroups, %llu drawn (DM_VK_MESH_EMU_MB)", (unsigned long long)count, (unsigned long long)cap); count = cap; }
+    uint32_t pay = DMSH_MESH_EMU_LIST + 2 * (uint32_t)cap, pl = pay + (uint32_t)(cap * pw), ix = pl + (uint32_t)(cap * planes), td = ix + (uint32_t)(cap * maxp);
+    uint32_t h[16] = {0};
+    h[DMSH_MESH_EMU_DISPATCH] = sh[6] ? 0 : (uint32_t)count; h[DMSH_MESH_EMU_DISPATCH + 1] = h[DMSH_MESH_EMU_DISPATCH + 2] = 1;
+    h[DMSH_MESH_EMU_DRAW + 1] = 1; h[DMSH_MESH_EMU_CAPACITY] = (uint32_t)cap; h[DMSH_MESH_EMU_FIRST] = (uint32_t)dw->first;
+    h[DMSH_MESH_EMU_PAYLOADS] = pay; h[DMSH_MESH_EMU_PLANES] = pl; h[DMSH_MESH_EMU_INDICES] = ix; h[DMSH_MESH_EMU_HAS_TASK] = sh[6] != NULL;
+    uint32_t tdisp[3] = {(uint32_t)count, 1, 1};
+    vka_rp_end();
+    vk.vkCmdUpdateBuffer(g_cb, g_memu.buf, 0, sizeof h, h);
+    vk.vkCmdUpdateBuffer(g_cb, g_memu.buf, 4 * (VkDeviceSize)td, sizeof tdisp, tdisp);
+    if (dw->ind) {   // {count, first} from the GPU: into the first dispatch's x and the header's first workgroup
+        VkBuffer ib; VkDeviceSize io;
+        if (!vka_addr(dw->ind, 8, &ib, &io, NULL) || (io & 3)) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) VRED("mesh emulation: indirect arguments at %#llx are not in placed guest RAM: skipped", (unsigned long long)dw->ind); return 0; }
+        VkBufferCopy c[2] = {{io, 4 * (VkDeviceSize)(sh[6] ? td : DMSH_MESH_EMU_DISPATCH), 4}, {io + 4, 4 * (VkDeviceSize)DMSH_MESH_EMU_FIRST, 4}};
+        vk.vkCmdCopyBuffer(g_cb, ib, g_memu.buf, 2, c);
+    }
+    vka_barrier(g_cb);
+    g_memu_on = 1; g_memu_range = 4 * (VkDeviceSize)(td + 3);
+    for (int st = 6; st <= 7; st++) {
+        if (!sh[st]) continue;
+        vka_shader *one[VKA_NSTAGE] = {0}; one[st] = sh[st];
+        vka_layout lay; if (!vka_layout_of(one, 1, &lay)) { VRED_ONCE("mesh emulation: no compute layout"); g_memu_on = 0; return 0; }
+        VkPipeline p = vka_cs_pipeline(sh[st], &lay);
+        if (!p) { g_memu_on = 0; return 0; }
+        walk_all(d, one);
+        if (make_images(d, one, 1)) make_images(d, one, 0);
+        c0_at c0 = {0};
+        if (!bind_sets(d, one, &lay, VK_PIPELINE_BIND_POINT_COMPUTE, &c0)) { g_memu_on = 0; return 0; }
+        vk.vkCmdBindPipeline(g_cb, VK_PIPELINE_BIND_POINT_COMPUTE, p);
+        if (st == 6 ? dw->ind != 0 : (sh[6] || dw->ind)) vk.vkCmdDispatchIndirect(g_cb, g_memu.buf, 4 * (VkDeviceSize)(st == 6 ? td : DMSH_MESH_EMU_DISPATCH));
+        else if (count) vk.vkCmdDispatch(g_cb, (uint32_t)count, 1, 1);
+        vka_barrier(g_cb);
+        g_dispatches++;
+    }
+    int lg = VKA_ENV("DM_VK_MESH_EMU_LOG", 0);
+    if (lg != g_memu_log_gen) { g_memu_log_gen = lg; g_memu_logged = 0; }
+    if (g_memu_rb.buf) memu_rb_drain(0);
+    if (g_memu_logged < lg && memu_rb_buf()) {
+        uint64_t vka_frame(void);
+        int slot = g_memu_rb_n++ % 64;
+        if (g_memu_rb_frame[slot]) memu_rb_drain(1);   // (the ring went round before its frames were done: what it holds, as it is)
+        VLOG("mesh emulation draw %d: task %016llx mesh %016llx, %s %d (first %d), capacity %llu, plane words %llu, max primitives %llu, payload words %llu%s",
+             g_memu_logged, sh[6] ? (unsigned long long)sh[6]->key : 0ull, (unsigned long long)sh[7]->key, dw->ind ? "indirect at" : "count", dw->ind ? 0 : dw->count, dw->first,
+             (unsigned long long)cap, (unsigned long long)planes, (unsigned long long)maxp, (unsigned long long)pw, dw->ind ? " (arguments read by the GPU)" : "");
+        VkBufferCopy c = {0, 64 * (VkDeviceSize)slot, 64};
+        vk.vkCmdCopyBuffer(g_cb, g_memu.buf, g_memu_rb.buf, 1, &c);
+        VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
+        vk.vkCmdPipelineBarrier(g_cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+        vka_barrier(g_cb);
+        g_memu_rb_frame[slot] = vka_frame(); g_memu_rb_keys[slot][0] = sh[6] ? sh[6]->key : 0; g_memu_rb_keys[slot][1] = sh[7]->key;
+        g_memu_logged++;
+    }
+    return 1;
+}
+
 void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc, int has_sc, const p_draw *dw, const p_draw_idx *di) {
     if (!g_cb || !draws_on() || !statics()) { g_skipped++; return; }
     if (!d->inited) vka_dstate_reset(d);
@@ -1053,9 +1185,11 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
     PT(0);
     // An NVN2 mesh draw (nvnCommandBufferDrawMeshTasks, hle_nvn.c): the task (optional) and mesh shaders of one program, the fragment stage's shader, in a mesh pipeline
     // (vka_pso.c pstate_fill) drawn with vkCmdDrawMeshTasksEXT: no vertex input, primitive type or index buffer
-    const int mesh = dw && dw->prim == NVN_PRIM_MESH;
-    if (mesh) {
-        if (!V.mesh) SKIP("mesh draw (nvnCommandBufferDrawMeshTasks) on a device without VK_EXT_mesh_shader (or DM_VK_MESH=0): skipped");
+    // Without VK_EXT_mesh_shader the draw is emulated (memu_run: memu): after the dispatches it goes on as a vertex draw of the mesh entry's emulation vertex shader
+    const int mesh_req = dw && dw->prim == NVN_PRIM_MESH;
+    int mesh = mesh_req && V.mesh, memu = mesh_req && !V.mesh;
+    if (mesh_req) {
+        if (mesh && dw->ind) SKIP("indirect mesh draw on a device with VK_EXT_mesh_shader: not on Vulkan yet ({count, first} arguments); skipped");
         // The program whose task and mesh shaders run: the fragment stage's when it has a mesh shader (a program's stages are bound together), else the one bound at the
         // mesh stage bit. Task and mesh come from the same program (a program's task shader feeds its own mesh shader)
         const prog_t *mp = d->bst[7];
@@ -1071,9 +1205,14 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
             SKIP("mesh draw: pixel shader %016llx reads per-primitive inputs that mesh shader %016llx does not write: skipped", (unsigned long long)sh[1]->key, (unsigned long long)sh[7]->key);
         if (sh[1] && !(sh[1]->e->flags & DMSH_VK_F_MESH_PRIM) && (sh[7]->e->flags & DMSH_VK_F_MESH_PRIM))
             VRED_ONCE("mesh draw: mesh shader %016llx writes per-primitive outputs and pixel shader %016llx has no per-primitive inputs: any it reads there are undefined", (unsigned long long)sh[7]->key, (unsigned long long)sh[1]->key);
-        if (dw->first) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 4) VRED("mesh draw with first workgroup %d (count %d): drawn from 0 (the translated task / mesh shaders read their workgroup index with no base; open)", dw->first, dw->count); }
-        if (dw->count <= 0) return;
+        if (mesh && dw->first) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 4) VRED("mesh draw with first workgroup %d (count %d): drawn from 0 (the translated task / mesh shaders read their workgroup index with no base; open)", dw->first, dw->count); }
+        if (dw->count <= 0 && !dw->ind) return;
         if (d->tf_on) VRED_ONCE("transform feedback with a mesh draw: drawn without capture");
+        if (memu) {
+            if (!VKA_ENV("DM_VK_MESH_EMU", 1)) SKIP("mesh draw: emulation off (DM_VK_MESH_EMU=0): skipped");
+            if (!memu_run(d, dw, sh)) { g_skipped++; return; }
+            sh[0] = sh[7]; sh[6] = sh[7] = NULL;   // the draw: slot 0 the mesh entry (its DMSH_VK_MOD_MESH_EMU_VS module: VKA_KEY_MESH_EMU), the pixel shader
+        }
     } else {
         for (int st = 0; st < 5; st++) if (!resolve(d->bst[st], st, &sh[st], &bad)) SKIP("draw skipped: no shader library");
         if (bad) { g_skipped++; return; }   // a refused or missing shader (logged when it was made)
@@ -1085,12 +1224,13 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
     if (d->poly.cull == NVN_FACE_FRONT_AND_BACK && !d->rast_discard) return;
     int prim = dw ? dw->prim : di->prim, expand = 0;
     VkPrimitiveTopology topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;   // (a mesh pipeline's: every translated mesh shader outputs triangles)
-    if (!mesh) {
+    if (memu) topo = g_memu_points ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    else if (!mesh) {
         topo = topology(prim, &expand);
         if (expand < 0) SKIP("primitive type %d not on Vulkan: the draw is skipped", prim);
         if (topo == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST) SKIP("tessellation patches are not on Vulkan yet (no patch size is recorded): the draw is skipped");
     }
-    uint64_t ind = dw ? dw->ind : di->ind;
+    uint64_t ind = memu ? 0 : dw ? dw->ind : di->ind;   // (an emulated mesh draw's arguments are in the emulation buffer)
     // A geometry shader that writes memory makes those writes in the run that claims its primitive (vka_spv_gs_claim): a zeroed word per primitive at VKA_GS_CLAIM_BINDING.
     // Primitive IDs restart with each instance and an indirect draw's count is the GPU's, so those draws take the shader as it is (each run writing)
     g_claim_words = 0;
@@ -1173,7 +1313,8 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
         for (uint32_t i = 0; i < R.ncolor; i++) if (R.cf[i] && (R.ckind[i] == 1 || R.ckind[i] == 2) && (fs->e->fout_mask >> i & 1) && (fs->e->fout_types >> (2 * i) & 3) == DMSH_VK_TYPE_FLOAT) { if (R.ckind[i] == 1) fu |= 1u << i; else fsm |= 1u << i; }
         if ((fu | fsm) && vka_shader_fout_retyped((vka_shader *)fs, fu, fsm)) variant = VKA_FS_RETYPE;
     }
-    k.fs_variant = (uint8_t)variant; k.gs_fx = g_claim_words != 0;
+    if (memu && fs && (fs->e->flags & DMSH_VK_F_MESH_PRIM)) variant = DMSH_VK_MOD_MESH_EMU_FLAT;   // its per-primitive inputs Flat: the emulation vertex shader's outputs
+    k.fs_variant = (uint8_t)(variant | (memu ? VKA_KEY_MESH_EMU : 0)); k.gs_fx = g_claim_words != 0;
     int src1_used = 0;
     for (uint32_t i = 0; i < R.ncolor; i++) {
         k.cfmt[i] = R.cf[i];
@@ -1281,6 +1422,9 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
         uint32_t maxg = sh[6] ? V.task_groups : V.mesh_groups;
         if ((uint32_t)dw->count > maxg) SKIP("mesh draw of %d workgroups: more than the device's %u in one dimension; skipped", dw->count, maxg);
         vk.vkCmdDrawMeshTasksEXT(g_cb, (uint32_t)dw->count, 1, 1);
+    } else if (memu) {   // the vertex count the mesh workgroups wrote (DMSH_MESH_EMU_DRAW)
+        vk.vkCmdDrawIndirect(g_cb, g_memu.buf, 4 * (VkDeviceSize)DMSH_MESH_EMU_DRAW, 1, 16);
+        g_memu_on = 0;
     } else if (expand) {   // quads or a line loop: the indices made here, 32-bit, in scratch memory
         uint32_t count = (uint32_t)(dw ? dw->count : di->count), *src = NULL;
         if (di && !(src = read_indices(di->ibuf, di->itype, count))) SKIP("indices at %#llx are not readable: the draw is skipped", (unsigned long long)di->ibuf);

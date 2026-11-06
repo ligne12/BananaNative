@@ -76,6 +76,8 @@ static void shuffle_plan(void) {
          : want ? "the instruction (the device's shared memory is under DMSH_VK_SHARED_MAX)" : "the instruction (DM_VK_SHUFFLE_LDS=1: through workgroup memory)");
 }
 VkShaderModule vka_shader_cs_module(vka_shader *s) {
+    // An emulated task / mesh program (vka_draw.c memu_run): its compute module
+    if ((s->e->stage == DMSH_VK_STAGE_TS || s->e->stage == DMSH_VK_STAGE_MS) && !V.mesh) return vka_shader_module(s, DMSH_VK_MOD_MESH_EMU);
     if (g_shuffle_lds < 0) shuffle_plan();
     VkShaderModule m = g_shuffle_lds && vka_shlib_module(s->lib, s->e, DMSH_VK_MOD_SHUFFLE_LDS) ? vka_shader_module(s, DMSH_VK_MOD_SHUFFLE_LDS) : VK_NULL_HANDLE;
     return m ? m : s->mods[DMSH_VK_MOD_BASE];   // (that module not made: logged by vka_shader_module; the base one)
@@ -189,10 +191,15 @@ static const char *refusal(const vka_shlib *L, const dmsh_vk_entry *e) {
     if (e->flags & DMSH_VK_F_INTERLOCK) return "fragment shader interlock";
     if (e->stage == DMSH_VK_STAGE_GS && !V.geom) return "a geometry shader on a device without geometryShader";
     if ((e->stage == DMSH_VK_STAGE_TCS || e->stage == DMSH_VK_STAGE_TES) && !V.tess) return "a tessellation shader on a device without tessellationShader";
-    // NVN2 task and mesh programs, and the pixel shaders that read their per-primitive outputs (valid only in a mesh pipeline): only with VK_EXT_mesh_shader (vka_dev.c)
-    if ((e->stage == DMSH_VK_STAGE_TS || e->stage == DMSH_VK_STAGE_MS || (e->flags & DMSH_VK_F_MESH_PRIM)) && !V.mesh) return "a task / mesh shader (or a pixel shader of their per-primitive outputs) on a device without VK_EXT_mesh_shader (or DM_VK_MESH=0)";
-    if (e->stage == DMSH_VK_STAGE_TS && !V.task) return "a task shader on a device with mesh shaders but without taskShader";
-    if (e->stage == DMSH_VK_STAGE_TS || e->stage == DMSH_VK_STAGE_MS) {   // the workgroup (the entry's local) within the device's limit
+    // NVN2 task and mesh programs, and the pixel shaders that read their per-primitive outputs (valid only in a mesh pipeline): with VK_EXT_mesh_shader (vka_dev.c), else
+    // emulated (vka_draw.c memu_run) through their DMSH_VK_MOD_MESH_EMU* modules, which a library before them lacks
+    int tsms = e->stage == DMSH_VK_STAGE_TS || e->stage == DMSH_VK_STAGE_MS;
+    if (!V.mesh && tsms && (!vka_shlib_module(L, e, DMSH_VK_MOD_MESH_EMU) || (e->stage == DMSH_VK_STAGE_MS && !vka_shlib_module(L, e, DMSH_VK_MOD_MESH_EMU_VS))))
+        return "a task / mesh shader on a device without VK_EXT_mesh_shader (or DM_VK_MESH=0), with no emulation module in its library";
+    if (!V.mesh && !tsms && (e->flags & DMSH_VK_F_MESH_PRIM) && !vka_shlib_module(L, e, DMSH_VK_MOD_MESH_EMU_FLAT))
+        return "a pixel shader of per-primitive mesh outputs on a device without VK_EXT_mesh_shader, with no emulation module in its library";
+    if (V.mesh && e->stage == DMSH_VK_STAGE_TS && !V.task) return "a task shader on a device with mesh shaders but without taskShader";
+    if (V.mesh && tsms) {   // the workgroup (the entry's local) within the device's limit
         uint64_t inv = (uint64_t)e->local[0] * e->local[1] * e->local[2];
         if (!inv || inv > (e->stage == DMSH_VK_STAGE_TS ? V.task_inv : V.mesh_inv)) return "a task / mesh workgroup larger than the device's (maxTaskWorkGroupInvocations / maxMeshWorkGroupInvocations)";
     }
@@ -224,7 +231,7 @@ static VkShaderModule spv_module(const vka_shlib *L, const dmsh_vk_entry *e, con
     return mod;
 }
 VkShaderModule vka_shader_module(vka_shader *s, int variant) {
-    if (variant < 0 || variant > DMSH_VK_MOD_SHUFFLE_LDS) return VK_NULL_HANDLE;
+    if (variant < 0 || variant > DMSH_VK_MOD_MESH_EMU_FLAT) return VK_NULL_HANDLE;
     if (s->mods[variant]) return s->mods[variant];
     const dmsh_vk_module *m = vka_shlib_module(s->lib, s->e, variant);
     if (!m) return VK_NULL_HANDLE;

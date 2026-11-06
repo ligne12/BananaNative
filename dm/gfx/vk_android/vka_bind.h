@@ -40,6 +40,7 @@ enum {
     VKA_R_GMEM_MAP,   // the guest → device address table of raw global memory
     VKA_R_GMEM_LOG,   // that memory's write log, cleared per draw or dispatch
     VKA_R_SHARED_SPILL,   // a compute program's shared memory past the device's limit (DMSH_VK_KIND_SHARED_SPILL): size = bytes of one workgroup's slice
+    VKA_R_MESH_EMU,   // an emulated mesh draw's region of the mesh emulation buffer (DMSH_VK_KIND_MESH_EMU; vka_draw.c memu_run): bound while that draw is recorded
 };
 typedef struct {
     uint8_t what, desc, flags, dim;    // VKA_R_*, VkDescriptorType, DMSH_VK_BF_*, DMSH_VK_DIM_*
