@@ -406,6 +406,11 @@ void vka_enc_stats(char *b, size_t n, double frames);   // the replay statistics
 int vka_nan_split(vka_img *const *ims, int n);
 int vka_nan_probe(uint64_t fs);
 void vka_nan_inputs(VkCommandBuffer cb, vka_img *const *ims, const int *binds, const int *tids, int n);
+int vka_nan_gpudump(void);   // DM_VK_NANSCAN_GPUDUMP set
+int vka_nan_query_reset(VkCommandBuffer cb, uint64_t key);   // DM_VK_NANSCAN_GPUDUMP: a query slot for a probed draw (outside a pass), -1 when none
+void vka_nan_query_begin(VkCommandBuffer cb, int slot);      // inside the pass, right before the draw
+void vka_nan_query_end(VkCommandBuffer cb, int slot);        // right after it; read when the submission is done
+void vka_nan_dump_targets(VkCommandBuffer cb, vka_img *const *ims, int n);   // the probed draw's colour targets after it (outside the pass), as the GPU holds them
 vka_img *vka_tex_id_img(int id, VkCommandBuffer cb);
 void vka_tex_id_dump(int id);
 void vka_tex_id_check(int id);                      // DM_VK_NANSCAN: has texture ID id's storage changed since its upload, and does the tracker know

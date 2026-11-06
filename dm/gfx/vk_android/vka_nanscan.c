@@ -133,16 +133,113 @@ static int scan_one(VkCommandBuffer cb, batch_t *b, vka_img *im, uint32_t lv, ui
     vk.vkCmdDispatch(cb, (w + 7) / 8, (h + 7) / 8, dz);
     return 1;
 }
-// DM_VK_NANSCAN_FS=<fragment shader key> (with DM_VK_NANSCAN=2): the first draw of each frame with that fragment shader has its sampled float textures scanned before it
-// (every level and layer, outside the pass): which input holds NaN / infinite texels. 1 = this draw is one (the caller ends the pass and calls vka_nan_inputs)
+// DM_VK_NANSCAN_FS=<fragment shader key>[,<key>…] (with DM_VK_NANSCAN=2; at most 4 keys): the first 4 draws of each frame with each of those fragment shaders have
+// their sampled float textures scanned before it (every level and layer, outside the pass): which input holds NaN / infinite texels. 1 = this draw is one (the caller ends the pass and
+// calls vka_nan_inputs)
+enum { NPROBE = 4 };
+static uint64_t g_probes[NPROBE], g_cur; static int g_nprobe;
 int vka_nan_probe(uint64_t fs) {
-    static uint64_t last = ~0ull; static int init; uint64_t key = g_probe;
-    if (!init) { init = 1; const char *e = getenv("DM_VK_NANSCAN_FS"); if (e) g_probe = key = strtoull(e, NULL, 16); }
-    if (!key || fs != key || last == vka_frame()) return 0;
-    last = vka_frame(); return 1;
+    static uint64_t last[NPROBE]; static int init;
+    if (!init) {
+        init = 1; const char *e = getenv("DM_VK_NANSCAN_FS");
+        for (char *x; e && *e && g_nprobe < NPROBE; e = *x == ',' ? x + 1 : x) { uint64_t k = strtoull(e, &x, 16); if (x == e) break; last[g_nprobe] = ~0ull; g_probes[g_nprobe++] = k; }
+        if (g_nprobe) g_probe = g_probes[0];
+    }
+    static int nin[NPROBE];   // draws probed in the frame last[i] (the first 4 of each frame and key: a text box draws one sheet after another)
+    int i = 0; while (i < g_nprobe && (!fs || fs != g_probes[i])) i++;
+    if (i == g_nprobe) return 0;
+    if (last[i] != vka_frame()) { last[i] = vka_frame(); nin[i] = 0; }
+    if (nin[i] >= 4) return 0;
+    nin[i]++; g_cur = fs; return 1;
 }
+// DM_VK_NANSCAN_GPUDUMP=1 (with DM_VK_NANSCAN=2 and DM_VK_NANSCAN_FS): the probed draw's sampled colour textures as the GPU holds them before it (level 0, layer 0, uncompressed
+// formats), each copied into a host-visible buffer of its own and written to DM_TEMP as gpu-<fragment key>-s<serial>-f<frame>-<w>x<h>-vk<VkFormat>.blk (rows packed)
+// once the submission is done: what a render target the GPU drew holds, which vka_tex_id_dump (guest storage) cannot show. The first 3 frames of each key, 48 files at most
+typedef struct { VkBuffer buf; VkDeviceMemory mem; void *map; uint64_t key, serial, frame; uint32_t w, h, vkf; int after; VkDeviceSize n; } gdump_t;
+static gdump_t *g_gd[64]; static int g_ngd, g_after;
+static void gdump_write(void *arg) {   // the completion thread, after the submission's fence
+    gdump_t *g = arg; char fn[512];
+    snprintf(fn, sizeof fn, "%s/gpu-%016llx-%s-s%llu-f%llu-%ux%u-vk%u.blk", getenv("DM_TEMP") ? getenv("DM_TEMP") : "/data/local/tmp", (unsigned long long)g->key,
+             g->after ? "after" : "in", (unsigned long long)g->serial, (unsigned long long)g->frame, g->w, g->h, g->vkf);
+    FILE *f = fopen(fn, "wb"); if (f) { fwrite(g->map, 1, (size_t)g->n, f); fclose(f); }
+    VLOG("NaN scan: GPU content of serial %llu (%ux%u VkFormat %u, %s a draw of %016llx, frame %llu) %s %s", (unsigned long long)g->serial, g->w, g->h, g->vkf,
+         g->after ? "target, after" : "input, before", (unsigned long long)g->key, (unsigned long long)g->frame, f ? "written to" : "could not be written to", fn);
+    vk.vkUnmapMemory(V.dev, g->mem); vk.vkDestroyBuffer(V.dev, g->buf, NULL); vk.vkFreeMemory(V.dev, g->mem, NULL); free(g);
+}
+static void gdump_record(VkCommandBuffer cb, vka_img *const *ims, int n) {
+    static _Atomic int total; static uint64_t keys[NPROBE], kf[NPROBE]; static int frames[NPROBE];
+    int ki = 0; while (ki < NPROBE && keys[ki] && keys[ki] != g_cur) ki++;
+    if (ki == NPROBE) return;
+    if (!keys[ki]) keys[ki] = g_cur;
+    if (kf[ki] != vka_frame()) { if (frames[ki] >= 3) return; frames[ki]++; kf[ki] = vka_frame(); }
+    int bar = 0;
+    for (int i = 0; i < n && g_ngd < 64; i++) {
+        vka_img *im = ims[i];
+        if (!im || !im->inited || im->samples != 1 || im->aspect != VK_IMAGE_ASPECT_COLOR_BIT || im->f.bw != 1 || im->f.bh != 1 || !im->f.bpb) continue;
+        VkDeviceSize sz = (VkDeviceSize)im->w * im->h * im->f.bpb; if (!sz || sz > (64u << 20) || atomic_fetch_add(&total, 1) >= 48) continue;
+        gdump_t *g = calloc(1, sizeof *g); if (!g) continue;
+        VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = sz, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        if (vk.vkCreateBuffer(V.dev, &bi, NULL, &g->buf)) { free(g); continue; }
+        VkMemoryRequirements mr; vk.vkGetBufferMemoryRequirements(V.dev, g->buf, &mr);
+        uint32_t t = vka_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0);
+        VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = t};
+        if (t == UINT32_MAX || vk.vkAllocateMemory(V.dev, &ai, NULL, &g->mem) || vk.vkBindBufferMemory(V.dev, g->buf, g->mem, 0) || vk.vkMapMemory(V.dev, g->mem, 0, VK_WHOLE_SIZE, 0, &g->map)) {
+            if (g->mem) vk.vkFreeMemory(V.dev, g->mem, NULL);
+            vk.vkDestroyBuffer(V.dev, g->buf, NULL); free(g); continue;
+        }
+        if (!bar) { vka_barrier(cb); bar = 1; }
+        VkBufferImageCopy r = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {im->w, im->h, 1}};
+        vk.vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, g->buf, 1, &r);
+        g->key = g_cur; g->serial = im->serial; g->frame = vka_frame(); g->w = im->w; g->h = im->h; g->vkf = (uint32_t)im->f.vk; g->n = sz; g->after = g_after;
+        g_gd[g_ngd++] = g;
+    }
+    if (bar) {
+        VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
+        vk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+        vka_barrier(cb);   // the draws after it see the image as before
+    }
+}
+// DM_VK_NANSCAN_GPUDUMP: queries around each probed draw, read when its submission is done: samples passed (occlusion) and, where the device has them, the pipeline
+// statistics (vertices, primitives, vertex shader invocations, primitives in and out of clipping, fragment shader invocations). Which stage loses a draw that writes nothing
+enum { NQS = 64 };
+static VkQueryPool g_qocc, g_qps; static int g_qok = -1, g_qnext; static uint64_t g_qkey[NQS], g_qframe[NQS];
+static PFN_vkCmdBeginQuery g_qbegin; static PFN_vkCmdEndQuery g_qend; static PFN_vkCmdResetQueryPool g_qreset; static PFN_vkGetQueryPoolResults g_qget;
+static int q_init(void) {
+    if (g_qok >= 0) return g_qok;
+    g_qok = 0;
+    g_qbegin = (PFN_vkCmdBeginQuery)vk.vkGetDeviceProcAddr(V.dev, "vkCmdBeginQuery"); g_qend = (PFN_vkCmdEndQuery)vk.vkGetDeviceProcAddr(V.dev, "vkCmdEndQuery");
+    g_qreset = (PFN_vkCmdResetQueryPool)vk.vkGetDeviceProcAddr(V.dev, "vkCmdResetQueryPool"); g_qget = (PFN_vkGetQueryPoolResults)vk.vkGetDeviceProcAddr(V.dev, "vkGetQueryPoolResults");
+    PFN_vkCreateQueryPool create = (PFN_vkCreateQueryPool)vk.vkGetDeviceProcAddr(V.dev, "vkCreateQueryPool");
+    if (!g_qbegin || !g_qend || !g_qreset || !g_qget || !create) return 0;
+    VkQueryPoolCreateInfo oc = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_OCCLUSION, .queryCount = NQS};
+    if (create(V.dev, &oc, NULL, &g_qocc)) { VLOG("NaN scan: no occlusion query pool"); return 0; }
+    VkQueryPoolCreateInfo pc = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS, .queryCount = NQS,
+        .pipelineStatistics = VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_VERTICES_BIT | VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_PRIMITIVES_BIT | VK_QUERY_PIPELINE_STATISTIC_VERTEX_SHADER_INVOCATIONS_BIT |
+                              VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT | VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT | VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT};
+    if (create(V.dev, &pc, NULL, &g_qps)) { g_qps = VK_NULL_HANDLE; VLOG("NaN scan: no pipeline statistics query pool (occlusion only)"); }
+    g_qok = 1; return 1;
+}
+int vka_nan_query_reset(VkCommandBuffer cb, uint64_t key) {   // outside a pass: a fresh slot for the probed draw, or -1
+    if (!q_init() || g_qnext >= NQS) return -1;
+    int s = g_qnext++;
+    g_qreset(cb, g_qocc, (uint32_t)s, 1); if (g_qps) g_qreset(cb, g_qps, (uint32_t)s, 1);
+    g_qkey[s] = key; g_qframe[s] = vka_frame(); return s;
+}
+void vka_nan_query_begin(VkCommandBuffer cb, int s) { g_qbegin(cb, g_qocc, (uint32_t)s, VK_QUERY_CONTROL_PRECISE_BIT); if (g_qps) g_qbegin(cb, g_qps, (uint32_t)s, 0); }
+static int g_qpend[NQS]; static int g_nqpend;
+void vka_nan_query_end(VkCommandBuffer cb, int s) { if (g_qps) g_qend(cb, g_qps, (uint32_t)s); g_qend(cb, g_qocc, (uint32_t)s); if (g_nqpend < NQS) g_qpend[g_nqpend++] = s; }
+static void q_report(void *arg) {   // the completion thread
+    int s = (int)(intptr_t)arg; uint64_t occ = 0, ps[6] = {0};
+    VkResult r1 = g_qget(V.dev, g_qocc, (uint32_t)s, 1, sizeof occ, &occ, sizeof occ, VK_QUERY_RESULT_64_BIT), r2 = g_qps ? g_qget(V.dev, g_qps, (uint32_t)s, 1, sizeof ps, ps, sizeof ps, VK_QUERY_RESULT_64_BIT) : VK_ERROR_FEATURE_NOT_PRESENT;
+    VLOG("NaN scan: probed draw of %016llx (frame %llu), the GPU's count: samples passed %llu%s; vertices %llu, primitives %llu, vertex shader invocations %llu, clipping in %llu / out %llu, fragment shader invocations %llu%s",
+         (unsigned long long)g_qkey[s], (unsigned long long)g_qframe[s], (unsigned long long)occ, r1 ? " (not available)" : "", (unsigned long long)ps[0], (unsigned long long)ps[1], (unsigned long long)ps[2],
+         (unsigned long long)ps[3], (unsigned long long)ps[4], (unsigned long long)ps[5], r2 ? " (statistics not available)" : "");
+}
+int vka_nan_gpudump(void) { static int gd = -1; if (gd < 0) gd = getenv("DM_VK_NANSCAN_GPUDUMP") && atoi(getenv("DM_VK_NANSCAN_GPUDUMP")) > 0; return gd; }
+void vka_nan_dump_targets(VkCommandBuffer cb, vka_img *const *ims, int n) { g_after = 1; gdump_record(cb, ims, n); g_after = 0; }
 void vka_nan_inputs(VkCommandBuffer cb, vka_img *const *ims, const int *binds, const int *tids, int n) {
     batch_t *b = &g_b[g_bi % NBATCH];
+    if (vka_nan_gpudump()) gdump_record(cb, ims, n);
     if (!ready()) return;
     int any = 0;
     for (int i = 0; i < n; i++) {
@@ -195,6 +292,10 @@ static void report(void *arg) {
 }
 void vka_nan_commit(uint64_t fence) {   // the submission's batch is read when fence is done; the next submission starts a new batch
     batch_t *b = &g_b[g_bi % NBATCH];
+    for (int i = 0; i < g_ngd; i++) vka_after(fence, gdump_write, g_gd[i]);   // DM_VK_NANSCAN_GPUDUMP: written once the GPU copied them
+    g_ngd = 0;
+    for (int i = 0; i < g_nqpend; i++) vka_after(fence, q_report, (void *)(intptr_t)g_qpend[i]);   // and the probed draws' queries
+    g_nqpend = 0;
     if (b->n) vka_after(fence, report, b);
     if (g_astc_state == 1) { g_astc_state = 2; vka_after(fence, astc_report, NULL); }
     g_bi++; g_b[g_bi % NBATCH].n = 0; g_pass = 0; g_nsplit = 0;

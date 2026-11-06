@@ -479,6 +479,7 @@ static struct { int valid; vka_span s; uint8_t b[DMSH_DRV_SIZE]; } g_dm[VKA_NSTA
 static struct { int valid; uint32_t ref; vka_span s; } g_sm_ref;   // the support buffer with the alpha test's reference (stage_writes)
 static int g_drv_memo = 1; static uint64_t g_dm_hit, g_dm_miss;
 static void drv_memo_reset(void) { for (int st = 0; st < VKA_NSTAGE; st++) for (int b = 0; b < 3; b++) g_dm[st][b].valid = 0; g_sm_ref.valid = 0; g_drv_memo = VKA_ENV("DM_VK_DRV_MEMO", 1); }
+static int g_kd_cur, g_kd_last; static void kd_file(int draw, const char *what, const void *p, size_t n, int guest);   // DM_VK_KEYDUMP_FULL (below, with the keydump)
 static int drv_seg(const vka_dstate *d, int st, int bank, int pool, VkDescriptorBufferInfo *bi, c0_at *c0) {
     size_t sz = vka_drv_size(bank); vka_span s;
     // One memo slot per segment kind: c0, c2 and the push bank. Any other driver bank (an all-zero c17-style read of DMSH_DRV_SIZE bytes) takes the fill below: sharing
@@ -487,6 +488,7 @@ static int drv_seg(const vka_dstate *d, int st, int bank, int pool, VkDescriptor
     if (g_drv_memo && bi_ >= 0 && st != 5 && sz <= DMSH_DRV_SIZE) {
         static uint8_t tmp[DMSH_DRV_SIZE];
         vka_drv_fill(&d->b, st, bank, pool, tmp);
+        if (g_kd_cur) { char w[24]; snprintf(w, sizeof w, "st%d-drv%d", st, bank); kd_file(g_kd_cur, w, tmp, sz, 0); }   // DM_VK_KEYDUMP_FULL: the segment as bound
         typeof(g_dm[0][0]) *m = &g_dm[st][bi_];
         if (m->valid && !memcmp(m->b, tmp, sz)) { g_dm_hit++; *bi = (VkDescriptorBufferInfo){m->s.buf, m->s.off, sz}; return 1; }
         if (!vka_scratch(sz, V.ub_align, &s)) return 0;
@@ -496,6 +498,7 @@ static int drv_seg(const vka_dstate *d, int st, int bank, int pool, VkDescriptor
     }
     if (!vka_scratch(sz, V.ub_align, &s)) return 0;
     vka_drv_fill(&d->b, st, bank, pool, s.ptr);
+    if (g_kd_cur) { char w[24]; snprintf(w, sizeof w, "st%d-drv%d", st, bank); kd_file(g_kd_cur, w, s.ptr, sz, 0); }   // DM_VK_KEYDUMP_FULL: the segment as bound
     *bi = (VkDescriptorBufferInfo){s.buf, s.off, sz};
     if (bank == 0 && c0) { c0->buf = s.buf; c0->off = s.off; }
     return 1;
@@ -670,9 +673,24 @@ static int keydump_draw(vka_shader *const sh[VKA_NSTAGE]) {   // the draw's numb
     int k = atomic_fetch_add(&g_kd_seen, 1) + 1;
     return k <= g_kd_max ? k : 0;
 }
+// DM_VK_KEYDUMP_FULL=1 (with DM_VK_KEYDUMP): each dumped binding, the driver segments the replay makes for the draw, its vertex streams and its indices written whole (at most
+// 256 KB each) to DM_TEMP as kd-<key>-d<draw>-<what>.bin: the guest's bytes as the CPU sees them at recording, the segments as bound. The inputs to run a shader on the CPU
+// g_kd_cur: the draw being dumped (bind_sets → drv_seg); g_kd_last: the last one bind_sets dumped (vka_draw: its indices and parameters)
+static void kd_file(int draw, const char *what, const void *p, size_t n, int guest) {
+    static int on = -1; if (on < 0) on = getenv("DM_VK_KEYDUMP_FULL") && atoi(getenv("DM_VK_KEYDUMP_FULL")) > 0;
+    if (!on || !p) return;
+    if (n > (256u << 10)) n = 256u << 10;
+    uint8_t *b = malloc(n ? n : 1); if (!b) return;
+    if (guest) dm_guest_read_mapped(b, (uintptr_t)p, n); else memcpy(b, p, n);
+    char fn[512]; snprintf(fn, sizeof fn, "%s/kd-%016llx-d%d-%s.bin", getenv("DM_TEMP") ? getenv("DM_TEMP") : "/data/local/tmp", (unsigned long long)g_kd_key, draw, what);
+    FILE *f = fopen(fn, "wb"); if (f) { fwrite(b, 1, n, f); fclose(f); }
+    free(b);
+}
 static void keydump_stage(int draw, int st, const vka_shader *sh, const vka_res *r, int n) {
     for (int i = 0; i < n; i++) {
         if (r[i].what != VKA_R_BUF) continue;
+        { char w[64]; snprintf(w, sizeof w, "st%d-b%u-%s-%016llx", st, r[i].binding, r[i].desc == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ? "ssbo" : "ubo", (unsigned long long)sh->key);
+          if (r[i].addr) kd_file(draw, w, (const void *)(uintptr_t)r[i].addr, (size_t)r[i].size, 1); }
         float f[32] = {0}; if (r[i].addr) dm_guest_read_mapped(f, (uintptr_t)r[i].addr, sizeof f);
         for (int h = 0; h < 2; h++)
             VLOG("keydump %016llx draw %d stage %d (%016llx) binding %u %s addr %#llx size %#llx words %d-%d: %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g", (unsigned long long)g_kd_key, draw,
@@ -687,9 +705,10 @@ static void keydump_vertices(int draw, const vka_dstate *d) {   // the draw's ve
     for (int s = 0; s < 16; s++) {
         if (!d->vbuf[s].address) continue;
         float f[16] = {0}; dm_guest_read_mapped(f, (uintptr_t)d->vbuf[s].address, sizeof f);
-        VLOG("keydump %016llx draw %d stream %d addr %#llx size %#llx stride %u: %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g", (unsigned long long)g_kd_key, draw, s,
-             (unsigned long long)d->vbuf[s].address, (unsigned long long)d->vbuf[s].size, s < d->nstream ? d->stream[s].stride : 0u,
+        VLOG("keydump %016llx draw %d stream %d addr %#llx size %#llx stride %u divisor %u: %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g", (unsigned long long)g_kd_key, draw, s,
+             (unsigned long long)d->vbuf[s].address, (unsigned long long)d->vbuf[s].size, s < d->nstream ? d->stream[s].stride : 0u, s < d->nstream ? d->stream[s].divisor : 0u,
              f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15]);
+        { char w[24]; snprintf(w, sizeof w, "stream%d", s); kd_file(draw, w, (const void *)(uintptr_t)d->vbuf[s].address, (size_t)d->vbuf[s].size, 1); }
     }
 }
 // One stage's results as descriptor writes. 0 = the draw cannot run (logged)
@@ -832,15 +851,17 @@ static int bind_sets(const vka_dstate *d, vka_shader *const sh[VKA_NSTAGE], cons
     uint64_t t1_ = g_prof ? cntvct() : 0;
     int kd = keydump_draw(sh);
     if (kd && sh[0]) keydump_vertices(kd, d);
+    g_kd_cur = kd; g_kd_last = kd;   // DM_VK_KEYDUMP_FULL: drv_seg writes the segments of this draw; vka_draw its indices
     for (int st = 0; st < VKA_NSTAGE; st++) {
         vka_shader *s = sh[st]; if (!s) continue;
         if (st == 1 && d->rast_discard) continue;   // no fragments: its stage's records are not read (the layout keeps them unwritten: partially bound is not needed for push descriptors)
         int n = g_wk.n[st];
-        if (n < 0) { static _Atomic int k; if (atomic_fetch_add(&k, 1) < 16) VRED("shader %016llx: %s; skipped", (unsigned long long)s->key, g_wk.why[st]); return 0; }
+        if (n < 0) { static _Atomic int k; if (atomic_fetch_add(&k, 1) < 16) VRED("shader %016llx: %s; skipped", (unsigned long long)s->key, g_wk.why[st]); g_kd_cur = 0; return 0; }
         any_pool |= g_wk.pool[st];
         if (kd) keydump_stage(kd, st, s, g_wk.r[st], n);
-        if (!stage_writes(d, st, s, g_wk.r[st], n, g_wk.pool[st], st == 5 ? c0 : NULL)) return 0;
+        if (!stage_writes(d, st, s, g_wk.r[st], n, g_wk.pool[st], st == 5 ? c0 : NULL)) { g_kd_cur = 0; return 0; }
     }
+    g_kd_cur = 0;
     if (g_prof) g_ps[1] += cntvct() - t1_;
     if (sh[2] && sh[2]->gs_fx > 0 && bp == VK_PIPELINE_BIND_POINT_GRAPHICS) {   // the claim words, zeroed (vka_spv_gs_claim); bound also when the draw takes no claim (the layout has them)
         if (g_w.n == 512) { VRED_ONCE("more than 512 descriptors in one draw"); return 0; }
@@ -1091,7 +1112,9 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
     walk_all(d, sh);
     if (make_images(d, sh, 1)) { vka_rp_end(); make_images(d, sh, 0); }
     if (R.on && R.bar_pending && bar_hazard(sh, d)) { g_bar_late++; vka_rp_end(); }   // the game barrier taken inside the pass is needed here: the pass ends (its full barrier) first
+    int probed = 0, qslot = -1, qbegun = 0;   // DM_VK_NANSCAN_GPUDUMP: this draw's targets are read back after it, and queries count what the GPU did with it
     if (vka_nan_on() >= 2 && sh[1] && !d->rast_discard && vka_nan_probe(sh[1]->key)) {   // DM_VK_NANSCAN_FS: this draw's sampled textures, scanned before it
+        probed = 1;
         char why[8]; int n = vka_walk(&d->b, 1, sh[1]->e, sh[1]->b, sh[1]->lib->h->ssbo_align, 0, rd_cb, NULL, g_res, 512, NULL, why, sizeof why), m = 0;
         static vka_img *ims[64]; static int bs[64], ts[64];
         for (int i = 0; i < n && m < 64; i++) if (g_res[i].what == VKA_R_TEX && g_res[i].tid) { ims[m] = vka_tex_id_img(g_res[i].tid, g_cb); bs[m] = g_res[i].binding; ts[m++] = g_res[i].tid;
@@ -1101,6 +1124,7 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
                 VLOG("NaN scan: input binding %u dim %#x texture ID %d sampler %d: %s; image inited %d gpu_owned %d track %d", g_res[i].binding, g_res[i].dim, g_res[i].tid, g_res[i].sid, why, im ? im->inited : -1, im ? im->gpu_owned : -1, im ? im->track : -1); } }
         int on = R.on; vka_rp_end(); (void)on;
         vka_nan_inputs(g_cb, ims, bs, ts, m);
+        if (vka_nan_gpudump()) qslot = vka_nan_query_reset(g_cb, sh[1]->key);   // (outside the pass: vka_rp_end above)
     }
     { int td = texdump_draw(sh);   // DM_VK_TEXDUMP: the textures this draw's pixel shader samples, described and their storage written to files
       if (td && sh[1] && !d->rast_discard) {
@@ -1183,6 +1207,13 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
     if (vka_nan_on()) vka_nan_draw(mesh ? sh[7]->key : sh[0]->key, fs ? fs->key : 0);
     PT(5);
     if (!bind_sets(d, sh, &lay, VK_PIPELINE_BIND_POINT_GRAPHICS, NULL)) { g_skipped++; return; }
+    if (g_kd_last) {   // DM_VK_KEYDUMP: the draw's parameters, and with DM_VK_KEYDUMP_FULL its indices
+        int kdn = g_kd_last; g_kd_last = 0;
+        VLOG("keydump %016llx draw %d: %s, primitive %d, count %d, instances %d, first %d, base vertex %d, base instance %d, index type %d at %#llx%s", (unsigned long long)g_kd_key, kdn,
+             di ? "indexed" : "arrays", di ? di->prim : dw ? dw->prim : -1, di ? di->count : dw ? dw->count : 0, di ? di->instances : dw ? dw->instances : 0, dw ? dw->first : 0,
+             di ? di->base_vertex : 0, di ? di->base_instance : dw ? dw->base_instance : 0, di ? di->itype : -1, di ? (unsigned long long)di->ibuf : 0ull, (di ? di->ind : dw ? dw->ind : 0) ? " (indirect)" : "");
+        if (di && di->ibuf && di->count > 0) kd_file(kdn, "indices", (const void *)(uintptr_t)di->ibuf, (size_t)di->count * (di->itype == 0 ? 1u : di->itype == 1 ? 2u : 4u), 1);
+    }
     PT(6);
     if (!mesh) vin_bind(d);
 
@@ -1266,7 +1297,7 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
     } else if (dw) {
         if (ind) { VkBuffer b; VkDeviceSize o; if (!vka_addr(ind, 16, &b, &o, NULL) || (o & 3)) SKIP("indirect draw arguments at %#llx are not in placed guest RAM: skipped", (unsigned long long)ind);
                    VRED_ONCE("indirect draws: the driver segment's base instance (c0 + 0x644) reads the record's, not the GPU's"); vk.vkCmdDrawIndirect(g_cb, b, o, 1, 16); }
-        else vk.vkCmdDraw(g_cb, (uint32_t)dw->count, inst, (uint32_t)dw->first, binst);
+        else { if (qslot >= 0) { vka_nan_query_begin(g_cb, qslot); qbegun = 1; } vk.vkCmdDraw(g_cb, (uint32_t)dw->count, inst, (uint32_t)dw->first, binst); }
     } else {
         VkBuffer ib; VkDeviceSize io; VkIndexType it = di->itype == 0 ? VK_INDEX_TYPE_UINT8 : di->itype == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
         size_t isz = di->itype == 0 ? 1 : di->itype == 1 ? 2 : 4;
@@ -1281,10 +1312,27 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
         ib_bind(ib, io, it);
         if (ind) { VkBuffer b; VkDeviceSize o; if (!vka_addr(ind, 20, &b, &o, NULL) || (o & 3)) SKIP("indirect draw arguments at %#llx are not in placed guest RAM: skipped", (unsigned long long)ind);
                    vk.vkCmdDrawIndexedIndirect(g_cb, b, o, 1, 20); }
-        else vk.vkCmdDrawIndexed(g_cb, (uint32_t)di->count, inst, 0, di->base_vertex, binst);
+        else { if (qslot >= 0) { vka_nan_query_begin(g_cb, qslot); qbegun = 1; } vk.vkCmdDrawIndexed(g_cb, (uint32_t)di->count, inst, 0, di->base_vertex, binst); }
     }
     g_draws++;
     PT(8);
+    if (qbegun) vka_nan_query_end(g_cb, qslot);   // DM_VK_NANSCAN_GPUDUMP (still inside the pass)
+    if (probed && vka_nan_gpudump()) {   // DM_VK_NANSCAN_GPUDUMP: the probed draw's colour targets (what it was given) and their content as the GPU holds them after it
+        vka_img *t[8]; int nt = R.nci < 8 ? R.nci : 8; memcpy(t, R.cim, sizeof *t * (size_t)nt);
+        for (int i = 0; i < nt; i++) if (t[i])
+            VLOG("NaN scan: probed draw of %016llx (%s, %d %s, %u instances): colour target %d serial %llu %ux%u VkFormat %d, write mask %#x, blend %u (src %u dst %u op %u / alpha src %u dst %u op %u), viewport %.1f %.1f %.1f %.1f, pass %ux%u",
+                 (unsigned long long)sh[1]->key, mesh ? "mesh" : di ? "indexed" : "arrays", dw ? dw->count : di ? di->count : 0, di ? "indices" : "vertices", inst, i,
+                 (unsigned long long)t[i]->serial, t[i]->w, t[i]->h, (int)t[i]->f.vk, k.att[i].mask, k.att[i].en, k.att[i].src, k.att[i].dst, k.att[i].op, k.att[i].srca, k.att[i].dsta, k.att[i].opa,
+                 d->vp[0][0], d->vp[0][1], d->vp[0][2], d->vp[0][3], R.area.extent.width, R.area.extent.height);
+        VLOG("NaN scan: probed draw of %016llx: Vulkan viewport %.1f %.1f %.1f %.1f depth %.2f-%.2f, scissor %d %d %u %u (game's %s), cull %u front face %u (NVN cull %d front %d, origin lower-left %d / queue %d), depth test %u, stencil test %u, rasterizer discard %d",
+             (unsigned long long)sh[1]->key, vp.x, vp.y, vp.width, vp.height, vp.minDepth, vp.maxDepth, scr.offset.x, scr.offset.y, scr.extent.width, scr.extent.height,
+             has_sc ? "set" : "none", DY.cull, DY.ff, (int)d->poly.cull, (int)d->poly.front, vka_origin_ll(), vka_queue_origin_ll(), DY.dt, DY.stt, d->rast_discard);
+        VLOG("NaN scan: probed draw of %016llx: alpha test: game's function %u (NVN: 1 never … 8 always), reference %g, the pipeline's %u, pixel shader alpha-tested %d; logic op %u",
+             (unsigned long long)sh[1]->key, (unsigned)d->color.alpha_func, d->alpha_ref, (unsigned)k.alpha_func, (sh[1]->e->flags & DMSH_VK_F_ALPHA_TEST) != 0, (unsigned)d->color.logic_op);
+        vka_rp_end();
+        vka_nan_dump_targets(g_cb, t, nt);
+        return;
+    }
     if (vka_nan_on() >= 2 && vka_nan_split(R.cim, R.nci)) vka_rp_end();   // DM_VK_NANSCAN=2: a scan inside the game's pass
 }
 
