@@ -606,6 +606,13 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Check:** the full Android build of Ocarina of Time (42,331 shaders, chain `9d178638884a`) logs no `Invalid reduction type`; `6e28359aa3558f61`'s module has its `OpAtomicCompareExchange` loops and validates.
 - **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md): on the AYN Thor the house went from washed out to dark with the window's light, Kokiri Forest got its contrast back, and the GPU time in the house fell from about 26 to 16 ms a frame (2026-11-06).
 
+### Positions of mesh programs emulated as compute
+
+- **Symptom:** (Android, a device without `VK_EXT_mesh_shader`) objects drawn by mesh programs in one pass and by vertex shaders in another speckled white, or lit edges dotted white, steady or flickering with the camera; the depth pass is right.
+- **Cause:** the build translates with relaxed precision (`XLATE_REDUCED`, the Mac default), where only a vertex stage's `Position` output is `Invariant`, and the driver keeps the computation behind an invariant output exact. Emulated as compute (`DMSH_VK_MOD_MESH_EMU`), a mesh program's position is a value stored to its region, which nothing covers, so the driver may fuse a multiply and an add that the vertex shader drawing the same object in the colour pass keeps apart. The colour pass tests depth `EQUAL` against the depth pass, and fails on scattered texels.
+- **Fix:** `vk_android_build.py` translates task and mesh programs with `reduced` off: `NoContraction` on every float multiply and add, as Maxwell runs FMUL and FADD unfused. A Vulkan chain change; Metal libraries are unchanged.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md): the door of Link's house (G-buffer by mesh `d4171cf9adf0504b`, colour by vertex shader `3439aaa071d868ae`) and grass and branch edges outside, speckled white; clean once the library was built again (Vulkan chain `5c4f6be1881b`).
+
 ### F2IP's rounding modes
 
 - **Symptom:** foliage drawn by mesh programs is pure white with a bloom halo, steady from frame to frame, while the rest of the scene is lit; the log has `[RED] vk: shader <key> (program stage 1) is not in the shader library` for mesh shaders, and the build failed them with `F2IP modifiers 0xc4, c R255`.

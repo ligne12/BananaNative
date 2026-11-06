@@ -910,7 +910,13 @@ def run_batch(batch):
         jobs[key], c1s[key] = NS['job_for'](key, name, _rec(name, k), bd)
         jobs[key].update(ANSWERS)
         if STAGE_OF[key] == 'ms': jobs[key]['gl_depth_spec'] = VK['SPEC_GL_DEPTH']
-        if STAGE_OF[key] in ('ts', 'ms'): jobs[key]['mesh_emu_reserve'] = True   # the region's binding, also in the native module (its emulated variants have the same bindings)
+        if STAGE_OF[key] in ('ts', 'ms'):
+            jobs[key]['mesh_emu_reserve'] = True   # the region's binding, also in the native module (its emulated variants have the same bindings)
+            # Exact arithmetic (NoContraction on every float multiply and add, as Maxwell runs FMUL and FADD unfused): emulated as compute, a mesh program's position is
+            # a value stored to the region, which no Invariant decoration covers, so the driver may fuse it differently from the vertex shader that draws the same object
+            # in another pass. Depth EQUAL then failed on scattered texels: Ocarina of Time's door and foliage edges speckled white (G-buffer by mesh d4171cf9adf0504b,
+            # colour by vertex shader 3439aaa071d868ae)
+            jobs[key]['reduced'] = False
     r = translate([jobs[k] for k in batch], bd, batch[0])
     xerr = {}
     for ln in r.stderr.splitlines():
