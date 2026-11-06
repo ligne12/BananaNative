@@ -102,6 +102,7 @@ static int init_once(void) {
     int x_ph = has_ext(de, nde, "VK_QCOM_queue_perf_hint");
     if (x_ph) dext[ndext++] = "VK_QCOM_queue_perf_hint";
     // Enabled wherever the device has it: the device is made when the app starts, before the launcher's env file is read, so DM_VK_PSTATS cannot decide it (vka_pso.c pstats)
+    V.membudget = has_ext(de, nde, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);   // (physical-device level: a query, nothing to enable)
     int x_pex = has_ext(de, nde, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
     if (x_pex) dext[ndext++] = VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME;
     free(de);
@@ -414,6 +415,7 @@ void vka_mem_grew(uint64_t bytes) {
     int ni; uint32_t ns; uint64_t img = vka_tex_mem_nolock(&ni), scr = vka_scratch_bytes(&ns), pl = vka_mem_placed_nolock(), sp = vks_bytes_nolock();
     VLOG("memory: placed pools %.0f MiB, images %.0f MiB (%d), sparse tile blocks %.0f MiB, scratch %.0f MiB (%u blocks): %.0f MiB", pl / 1048576.0, img / 1048576.0, ni, sp / 1048576.0,
          scr / 1048576.0, ns, (pl + img + sp + scr) / 1048576.0);
+    vka_ctl_stats_soon();   // (taken at the next frame, outside the locks held here)
 }
 // Idle blocks (their value reached) larger than the standard 16 MiB, or beyond 64 MiB of idle blocks in all, are freed (under g_smu): at every miss and at every retire.
 // Kept, every block stayed for the process's life: Mario Kart World 1.8.0's boot uploads (levels of up to 144 MiB, each in a block of its size) left 1.4 GB of scratch
@@ -550,16 +552,32 @@ void vka_up_flush(void) {
 }
 // Backpressure: the batches in flight hold at most DM_VK_UPLOAD_INFLIGHT_MB of staging (the oldest is waited for; the GPU runs them in queue order). Called where the
 // replay thread holds no lock (vka_tex_get after the table lock, chunk, the commit): the present and other threads that take the image table do not wait for the GPU
+static VkDeviceSize up_flight(uint64_t *oldest) {   // the staging of the batches the GPU has not reached, and the oldest one's value
+    uint64_t udone = up_done(); VkDeviceSize fl = 0; *oldest = UINT64_MAX;
+    pthread_mutex_lock(&g_smu);
+    for (sblk *b = g_busy; b; b = b->next) if (b->up && b->fence > udone) { fl += b->size; if (b->fence < *oldest) *oldest = b->fence; }
+    pthread_mutex_unlock(&g_smu);
+    return fl;
+}
+uint64_t vka_up_inflight(void) { uint64_t o; return g_utl ? up_flight(&o) : 0; }
 void vka_up_throttle(void) {
     if (!g_utl) return;
     double cap = VKA_ENVF("DM_VK_UPLOAD_INFLIGHT_MB", 256.0) * 1048576.0;
     for (;;) {
-        uint64_t udone = up_done(), oldest = UINT64_MAX; VkDeviceSize fl = 0;
-        pthread_mutex_lock(&g_smu);
-        for (sblk *b = g_busy; b; b = b->next) if (b->up && b->fence > udone) { fl += b->size; if (b->fence < oldest) oldest = b->fence; }
-        pthread_mutex_unlock(&g_smu);
+        uint64_t oldest; VkDeviceSize fl = up_flight(&oldest);
         if ((double)fl <= cap || oldest == UINT64_MAX || !up_wait(oldest)) break;
     }
+}
+uint64_t vka_heap_usage(uint64_t *budget) {
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT b = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 mp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &b};
+    uint64_t use = 0, bud = 0;
+    if (V.membudget && vk.vkGetPhysicalDeviceMemoryProperties2) {
+        vk.vkGetPhysicalDeviceMemoryProperties2(V.pd, &mp);
+        for (uint32_t i = 0; i < mp.memoryProperties.memoryHeapCount; i++) { use += b.heapUsage[i]; bud += b.heapBudget[i]; }
+    }
+    if (budget) *budget = bud;
+    return use;
 }
 void vka_up_stats(uint64_t *batches, uint64_t *waits, double *wait_ms) { if (batches) *batches = g_n_ubatch; if (waits) *waits = g_n_uwait; if (wait_ms) *wait_ms = g_uwait_ns / 1e6; }
 #endif

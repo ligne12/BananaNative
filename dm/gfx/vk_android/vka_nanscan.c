@@ -22,7 +22,13 @@ static uint32_t g_pass; static uint64_t g_pvs[NKEY], g_pfs[NKEY]; static uint32_
 static uint64_t g_probe; static int g_split, g_nsplit; static uint32_t g_step = 64, g_from, g_to = UINT32_MAX; static uint64_t g_only;
 static _Atomic int g_lines;
 
-int vka_nan_on(void) {
+// DM_VK_NANSCAN_HOLD=1 (live, read again only at a submission's end, so a pass's scan and its commit stay in one submission): the scan holds off while set, so a run can
+// scan only a stretch of play (a probe arms it at a save's load) at the scan's cost only there
+static int g_hold = -1;
+void vka_nan_live(void) { g_hold = VKA_ENV("DM_VK_NANSCAN_HOLD", 0) != 0; }
+static int nan_level(void);
+int vka_nan_on(void) { int v = nan_level(); if (v && g_hold < 0) vka_nan_live(); return g_hold > 0 ? 0 : v; }
+static int nan_level(void) {
     static int v = -1; if (v >= 0) return v;
     const char *e = getenv("DM_VK_NANSCAN"); v = e && atoi(e) > 0 && V.push_desc ? atoi(e) : 0;
     if (v >= 2) {

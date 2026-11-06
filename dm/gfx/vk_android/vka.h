@@ -18,7 +18,7 @@
 #define VKA_GLOBAL_FNS(X) X(vkCreateInstance) X(vkEnumerateInstanceExtensionProperties) X(vkEnumerateInstanceLayerProperties) X(vkEnumerateInstanceVersion)
 #define VKA_INSTANCE_FNS(X) \
     X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) X(vkGetPhysicalDeviceProperties2) X(vkGetPhysicalDeviceFeatures) X(vkGetPhysicalDeviceFeatures2) \
-    X(vkGetPhysicalDeviceMemoryProperties) X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkGetPhysicalDeviceFormatProperties) X(vkGetPhysicalDeviceImageFormatProperties) X(vkGetPhysicalDeviceSparseImageFormatProperties) \
+    X(vkGetPhysicalDeviceMemoryProperties) X(vkGetPhysicalDeviceMemoryProperties2) X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkGetPhysicalDeviceFormatProperties) X(vkGetPhysicalDeviceImageFormatProperties) X(vkGetPhysicalDeviceSparseImageFormatProperties) \
     X(vkEnumerateDeviceExtensionProperties) X(vkCreateDevice) X(vkGetDeviceProcAddr) \
     X(vkCreateAndroidSurfaceKHR) X(vkDestroySurfaceKHR) X(vkGetPhysicalDeviceSurfaceSupportKHR) X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) \
     X(vkGetPhysicalDeviceSurfaceFormatsKHR) X(vkGetPhysicalDeviceSurfacePresentModesKHR)
@@ -87,6 +87,7 @@ typedef struct {
     // NVN2 task and mesh programs (VK_EXT_mesh_shader: mesh = meshShader, task = taskShader too; DM_VK_MESH=0 leaves it off): their shaders are refused without it (vka_shader.c refusal)
     // and their draws skipped. mesh_inv / task_inv: the largest workgroup (maxMeshWorkGroupInvocations / maxTaskWorkGroupInvocations); mesh_out_v / mesh_out_p: the most vertices /
     // primitives a mesh workgroup may output; task_payload: maxTaskPayloadSize; task_groups / mesh_groups: maxTaskWorkGroupCount[0] / maxMeshWorkGroupCount[0] (a draw's count)
+    int membudget;   // VK_EXT_memory_budget: the driver's heap usage in ctl "stats" (vka_heap_usage)
     int pstats;   // DM_VK_PSTATS: VK_KHR_pipeline_executable_properties enabled (vka_pso.c pstats)
     int mesh, task; uint32_t mesh_inv, task_inv, mesh_out_v, mesh_out_p, task_payload, task_groups, mesh_groups;
     int gpl;                                        // graphics pipeline libraries with fast linking (VK_EXT_graphics_pipeline_library): a pipeline the cache lacks is linked from stage libraries at once, the optimized one made in the background (vka_pso.c)
@@ -160,6 +161,11 @@ VkCommandBuffer vka_rp_cb(void);                    // the replay's command buff
 // went in a game that the system stops before its first frame (Mario Kart World 1.8.0 on a 16 GB phone). Values read without the owners' locks (a log line, called under them)
 void vka_mem_grew(uint64_t bytes);
 uint64_t vka_scratch_bytes(uint32_t *blocks);
+void vka_tex_objects(int reap, char *b, size_t n);   // texture objects dropped without a Finalize: counted (b), released with reap (DM_VK_TEX_REAP)
+void vka_nan_live(void);                            // DM_VK_NANSCAN_HOLD read again (at a submission's end)
+void vka_ctl_stats_soon(void);                      // ctl "stats" at the next frame
+uint64_t vka_up_inflight(void);                     // upload batch staging the GPU has not reached yet
+uint64_t vka_heap_usage(uint64_t *budget);          // the driver's count of this process's Vulkan memory (VK_EXT_memory_budget; 0 without it)
 uint64_t vka_mem_placed_nolock(void);
 uint64_t vka_tex_mem_nolock(int *n);
 
@@ -201,8 +207,9 @@ typedef struct {
 int vka_fmt_of(int nvn_format, vka_fmt *f);         // 0 = no Vulkan format (logged once per format)
 // An image's memory (vka_imgmem.c): space in a shared block (blk, at off, units of 256 bytes) or a dedicated allocation (blk NULL, off 0); size = its memory requirements' size
 // z: zero-shared memory (vka_imem_bind_zero; dm is the shared allocation, freed with its last image)
-typedef struct { VkDeviceMemory dm; uint64_t off, size; void *blk; uint32_t units; int z; } vka_imem;
+typedef struct { VkDeviceMemory dm; uint64_t off, size; void *blk; uint32_t units; int z, pw; } vka_imem;   // pw: in a pool window (blk is the window)
 VkResult vka_imem_bind(VkImage img, uint32_t type, const VkMemoryRequirements *mr, vka_imem *m);   // allocated and bound, or the error with nothing allocated
+VkResult vka_imem_bind_pool(VkImage img, uint32_t type, const VkMemoryRequirements *mr, const void *pool, uint64_t gen, uint64_t psize, uint64_t off, uint64_t len, vka_imem *m, uint64_t *made);   // in the pool's window (vka_imgmem.c)
 VkResult vka_imem_bind_zero(VkImage img, uint32_t type, const VkMemoryRequirements *mr, const void *key, uint32_t klen, vka_imem *m, int *fresh);   // bound to the zeroed allocation of its key (vka_zshare.h)
 uint64_t vka_imem_zbytes(void); uint64_t vka_imem_zbytes_nolock(void);   // bytes of the zero-shared allocations
 void vka_imem_zowned(void);   // a zero-shared image got memory of its own (vka_tex.c img_own): counted for the stats line
@@ -219,6 +226,7 @@ typedef struct vka_img {
     // Content from guest storage (vka_tex.c storage_mode): track = re-uploaded when the CPU writes its pages (write-protected after each upload, nvn_dirty.c),
     // stamp = the dirty-page generation taken before the last upload, span = the tracked pool range that holds the storage
     int track, wb_pending; uint64_t stamp; const void *span;
+    uint64_t used; int evicting;   // the frame of its last lookup; chosen by the eviction under way (vka_tex.c DM_VK_TEX_EVICT_MB)
     uint64_t hash;           // DM_VK_NANSCAN: a hash of the storage at the last upload (vka_tex_id_check)
     uint64_t gw_seen; int from_mem; uint64_t head, up_fence; uint8_t *snap;   // head, up_fence: DM_VK_NANSCAN's storage watch   // the newest GPU write into guest memory its last upload included (vka_tex.c gw_t); content from guest storage (ST_TRACK / ST_FILL)
     // In a sparse virtual pool (hle_nvn.c nvn_sparse_*): the storage is read through the pool's 4 KB page table, never at mem (unmapped pages there are inaccessible);

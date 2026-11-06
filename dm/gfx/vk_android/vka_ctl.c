@@ -18,6 +18,7 @@
 #include <zlib.h>
 #include <math.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 _Atomic uint32_t vka_env_gen = 1;   // 1: call sites' zeroed caches read their switch on the first call
 
@@ -58,7 +59,7 @@ double vka_env_slow(vka_envc *c, const char *key, double def) {
 
 // Switches read once (at start, or when a device object is made): a live change is logged as taking effect at the next start
 static const char *const g_restart[] = {"DM_VK_VALIDATE", "DM_VK_DRIVER", "DM_VK_HOOKDIR", "DM_VK_PLACED", "DM_VK_PREFAULT", "DM_VK_PCACHE", "DM_VK_SHLIB", "DM_VK_SHLIB_CHECK", "DM_VK_GS_CLAIM", "DM_VK_SUBGROUP_PIN", "DM_VK_GPL", "DM_VK_MESH", "DM_VK_SUBGROUP_GS", "DM_VK_SHUFFLE_LDS", "DM_VK_ADPF", "DM_VK_ADPF_PIPELINE", "DM_VK_NANSCAN",
-                                        "DM_VK_NANSCAN_STEP", "DM_VK_NANSCAN_DRAWS", "DM_VK_NANSCAN_SERIAL", "DM_VK_NANSCAN_FS", "DM_VK_KEYDUMP_FULL", "DM_VK_MESH_EMU_MB", "DM_VK_WORKER",
+                                        "DM_VK_NANSCAN_STEP", "DM_VK_NANSCAN_DRAWS", "DM_VK_NANSCAN_SERIAL", "DM_VK_NANSCAN_FS", "DM_VK_KEYDUMP_FULL", "DM_VK_MESH_EMU_MB", "DM_VK_TEX_LAZY", "DM_VK_TEX_EVICT_MB", "DM_VK_TEX_EVICT_AGE", "DM_VK_TEX_PAGEOUT", "DM_VK_WORKER",
                                         "DM_VK_WORKER_FRAMES", "DM_VK_TEST_HANG", "DM_LSFG_DLL", "DM_FPS", "NXHOST_VK_SELFTEST", "DM_CTL", "DM_VK_PREWARM", "DM_VK_PREWARM_MAX", "DM_VK_PREWARM_FILE", "DM_VK_LC_GLOBAL",
                                         "DM_VK_PSO_ASYNC", NULL};
 // Switches the replay reads again after a change (VKA_ENV, or at use); a table, so the log line can say which kind a key is
@@ -143,7 +144,17 @@ static void stats_line(uint64_t f) {
     { char ab[400]; vka_tex_alias_stats(ab, sizeof ab); VLOG("ctl: %s", ab); }
     { char im[600]; vka_imem_stats(im, sizeof im); VLOG("ctl: %s", im); }
     { char bs[1000]; vka_tex_big_stats(bs, sizeof bs); if (bs[0]) VLOG("ctl: %s", bs); }
+    {   // What the counts above leave out: the scratch and the upload staging still in flight; the driver's heap usage (every VkDeviceMemory); kgsl's count of the process's
+        // GPU memory, whose excess over the heap usage is the driver's own (pipelines' code, command streams, descriptor pools)
+        uint32_t ns; uint64_t scr = vka_scratch_bytes(&ns), fl = vka_up_inflight(), bud, use = vka_heap_usage(&bud); unsigned long long kg = 0;
+        char p[64]; snprintf(p, sizeof p, "/sys/class/kgsl/kgsl/proc/%d/kernel", (int)getpid());
+        FILE *fp = fopen(p, "r"); if (fp) { if (fscanf(fp, "%llu", &kg) != 1) kg = 0; fclose(fp); }
+        VLOG("ctl: memory: scratch %.0f MB (%u blocks; upload staging in flight %.0f MB); the driver's heap usage %.0f MB (budget %.0f MB); kgsl %.0f MB (0: not readable)",
+             scr / 1e6, ns, fl / 1e6, use / 1e6, bud / 1e6, kg / 1e6);
+    }
+    { char to[300]; vka_tex_objects(0, to, sizeof to); VLOG("ctl: %s", to); }
 }
+void vka_ctl_stats_soon(void) { atomic_store(&g_stats, 1); }   // a stats line at the next frame (vka_mem_grew: what a burst of memory was made of)
 void vka_ctl_frame(uint64_t f) {   // mtl_set_frame: frame f begins
     snap(&g_rec[f % NREC], f);
     long c = atomic_load_explicit(&g_capture, memory_order_relaxed);
@@ -153,6 +164,7 @@ void vka_ctl_frame(uint64_t f) {   // mtl_set_frame: frame f begins
         if (f - 9 + 1 >= g_cap_to) { VLOG("ctl: capture done"); g_cap_from = g_cap_to = 0; }
     }
     if (atomic_exchange_explicit(&g_stats, 0, memory_order_relaxed)) stats_line(f);
+    if (f % 30 == 0 && VKA_ENV("DM_VK_TEX_REAP", 0)) vka_tex_objects(1, NULL, 0);   // texture objects dropped without a Finalize: their images let go (vka_tex.c)
 }
 
 // ---------- Screenshot ----------

@@ -9,7 +9,8 @@
 // Bananza: 8.07 GB RSS, killed at about 9.2 GB); an earlier version rounded every image up to a power of two (a third more for mipped textures, up to half for 8-16 MiB ones).
 // Lifetime: as before, an image's memory is given back in img_destroy, which runs once the GPU is done with the image (vka_after), after vkDestroyImage. A block with no image
 // left is freed, except one empty block a memory type keeps for the next images. The 64 MiB vkAllocateMemory runs outside the lock (other threads' allocations and frees go on).
-// Large never-written GPU-content images instead alias one zeroed allocation per create info (vka_imem_bind_zero; vka_tex.c "Zero-shared images")
+// Large never-written GPU-content images instead alias one zeroed allocation per create info (vka_imem_bind_zero; vka_tex.c "Zero-shared images"); the images of a GPU-only
+// pool's textures share one allocation laid out as the pool (vka_imem_bind_pool, "Pool windows" below)
 #if defined(__ANDROID__)
 #include "vka.h"
 #include "vka_extents.h"
@@ -23,7 +24,7 @@ typedef struct iblock { struct iblock *next; VkDeviceMemory dm; uint32_t type; v
 static iblock *g_blocks[VK_MAX_MEMORY_TYPES];
 static pthread_mutex_t g_imu = PTHREAD_MUTEX_INITIALIZER;
 // Stats (under g_imu): blocks, images in blocks (count, units' bytes, the images' own sizes), dedicated allocations (count, bytes), blocks freed, block allocations that failed
-static struct { uint64_t blocks, runs, run_bytes, req_bytes, ded, ded_bytes, freed, fail; } S;
+static struct { uint64_t blocks, runs, run_bytes, req_bytes, ded, ded_bytes, freed, fail, pw_n, pw_bytes, pw_imgs, pw_img_bytes, pw_fail; } S;
 
 // Shared memory for the image (it fits a block): 1, or 0 (a dedicated allocation)
 static int sharable(VkImage img, uint32_t type, const VkMemoryRequirements *mr) {
@@ -115,13 +116,74 @@ VkResult vka_imem_bind_zero(VkImage img, uint32_t type, const VkMemoryRequiremen
     m->dm = dm; m->size = mr->size; m->z = 1;
     return VK_SUCCESS;
 }
-uint64_t vka_imem_zbytes(void) { uint64_t b; pthread_mutex_lock(&g_imu); vkz_stats(&Z, NULL, NULL, &b, NULL); pthread_mutex_unlock(&g_imu); return b; }
-uint64_t vka_imem_zbytes_nolock(void) { uint64_t b = 0; for (int i = 0; i < Z.n; i++) b += Z.e[i].size; return b; }   // (a log line's value, read without the lock)
+// (with the pool windows' bytes: the images in them count 0 bytes each, as the zero-shared ones)
+uint64_t vka_imem_zbytes(void) { uint64_t b; pthread_mutex_lock(&g_imu); vkz_stats(&Z, NULL, NULL, &b, NULL); b += S.pw_bytes; pthread_mutex_unlock(&g_imu); return b; }
+uint64_t vka_imem_zbytes_nolock(void) { uint64_t b = S.pw_bytes; for (int i = 0; i < Z.n; i++) b += Z.e[i].size; return b; }   // (a log line's value, read without the lock)
+
+// ---------- Pool windows ----------
+// On the Switch a texture is its pool storage, and an engine's frame graph places its transient render targets over one memory, in turn: Zelda: Ocarina of Time
+// (0400486024DEC000) kept 723 GPU-written images over 660 MB of storage, 2,075 MB of image memory once Link walked in his house, and the phone's low-memory killer stopped it.
+// So the images of a pool the CPU cannot access (vka_tex.c pool_window: GPU content only; a virtual pool's address range as well) share one allocation laid out as the pool,
+// its window: an image at storage offset o
+// is bound at o * 17/16 rounded up to its alignment, within (o + its storage size) * 17/16. The driver's layout may take a sixteenth more than NVN's (UBWC metadata: depth
+// targets 2-4 %); images whose storage does not overlap never overlap, those whose storage overlaps alias as they do on the Switch (Vulkan: an alias's content is undefined
+// after another's write; every pass ends with a full barrier, vka_draw.c vka_rp_end). The window is made at the pool's first such image (its type: that image's) and freed
+// with its last; a pool initialized again (another serial) gets another
+typedef struct pwin { struct pwin *next; const void *pool; uint64_t gen, size; VkDeviceMemory dm; uint32_t type, refs; } pwin;
+static pwin *g_pw;
+static uint64_t pw_map(uint64_t o) { return o + (o >> 4); }
+static void pw_unref(pwin *w) {   // an image of w let go (g_imu not held)
+    pthread_mutex_lock(&g_imu); int last = !--w->refs;
+    if (last) { for (pwin **p = &g_pw; *p; p = &(*p)->next) if (*p == w) { *p = w->next; break; } S.pw_n--; S.pw_bytes -= w->size; }
+    pthread_mutex_unlock(&g_imu);
+    if (last) { vk.vkFreeMemory(V.dev, w->dm, NULL); free(w); }
+}
+// The image in the window of pool (serial gen, psize bytes), its storage at offset off (len bytes). *made: the window's bytes when this call made it. VK_SUCCESS, or an error
+// with nothing bound (VK_ERROR_FEATURE_NOT_PRESENT: it does not fit; the caller binds it as before). Callers hold vka_tex.c's table lock: no other window is made meanwhile
+VkResult vka_imem_bind_pool(VkImage img, uint32_t type, const VkMemoryRequirements *mr, const void *pool, uint64_t gen, uint64_t psize, uint64_t off, uint64_t len, vka_imem *m, uint64_t *made) {
+    memset(m, 0, sizeof *m); *made = 0;
+    uint64_t al = mr->alignment ? mr->alignment : 1, d = (pw_map(off) + al - 1) & ~(al - 1), wsize = (pw_map(psize) + 0xFFFF) & ~0xFFFFull;
+    if ((al & (al - 1)) || off + len > psize || d + mr->size > pw_map(off + len) || wsize > V.max_alloc) return VK_ERROR_FEATURE_NOT_PRESENT;
+    if (vk.vkGetImageMemoryRequirements2) {
+        VkMemoryDedicatedRequirements dr = {VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS};
+        VkMemoryRequirements2 r2 = {VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2, &dr};
+        VkImageMemoryRequirementsInfo2 ri = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2, NULL, img};
+        vk.vkGetImageMemoryRequirements2(V.dev, &ri, &r2);
+        if (dr.requiresDedicatedAllocation) return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+    pthread_mutex_lock(&g_imu);
+    pwin *w = g_pw; while (w && (w->pool != pool || w->gen != gen)) w = w->next;
+    int bad = w && !(mr->memoryTypeBits >> w->type & 1);   // (a type the window lacks)
+    if (w && !bad) w->refs++;
+    pthread_mutex_unlock(&g_imu);
+    if (bad) return VK_ERROR_FEATURE_NOT_PRESENT;
+    if (!w) {   // the pool's first image: its window, allocated without the lock (kgsl zeroes it)
+        VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = wsize, .memoryTypeIndex = type};
+        VkDeviceMemory dm; VkResult r = vk.vkAllocateMemory(V.dev, &ai, NULL, &dm);
+        if (r) { pthread_mutex_lock(&g_imu); uint64_t k = S.pw_fail++; pthread_mutex_unlock(&g_imu);
+                 if (k < 4) VRED("pool window of %.0f MiB (pool %p) not allocated (%d): its images keep memory of their own", wsize / 1048576.0, pool, r);
+                 return r; }
+        if (!(w = calloc(1, sizeof *w))) { vk.vkFreeMemory(V.dev, dm, NULL); return VK_ERROR_OUT_OF_HOST_MEMORY; }
+        w->pool = pool; w->gen = gen; w->size = wsize; w->dm = dm; w->type = type; w->refs = 1;
+        pthread_mutex_lock(&g_imu); w->next = g_pw; g_pw = w; S.pw_n++; S.pw_bytes += wsize; uint64_t nw = S.pw_n; pthread_mutex_unlock(&g_imu);
+        *made = wsize;
+        if (nw <= 16) VLOG("pool window: pool %p of %.1f MiB (serial %llu): %.1f MiB for its textures' images", pool, psize / 1048576.0, (unsigned long long)gen, wsize / 1048576.0);
+    }
+    VkResult r = vk.vkBindImageMemory(V.dev, img, w->dm, d);
+    if (r) { *made = 0; pw_unref(w); return r; }   // (a window made for it alone goes with it)
+    pthread_mutex_lock(&g_imu); S.pw_imgs++; S.pw_img_bytes += mr->size; pthread_mutex_unlock(&g_imu);
+    m->dm = w->dm; m->off = d; m->size = mr->size; m->blk = w; m->pw = 1;
+    return VK_SUCCESS;
+}
 void vka_imem_zowned(void) { pthread_mutex_lock(&g_imu); vkz_note_own(&Z); pthread_mutex_unlock(&g_imu); }
 
 // The memory back (after vkDestroyImage of the image bound to it, once the GPU is done with it)
 void vka_imem_free(vka_imem *m) {
     if (!m->dm) return;
+    if (m->pw) {   // in a pool window: freed with the window's last image
+        pthread_mutex_lock(&g_imu); S.pw_imgs--; S.pw_img_bytes -= m->size; pthread_mutex_unlock(&g_imu);
+        pw_unref(m->blk); memset(m, 0, sizeof *m); return;
+    }
     if (m->z) {   // a zero-shared allocation: freed with its last image
         pthread_mutex_lock(&g_imu); int last = vkz_unref(&Z, (uint64_t)(uintptr_t)m->dm); pthread_mutex_unlock(&g_imu);
         if (last < 0) VRED_ONCE("zero-shared image memory given back twice or never taken (left as it is)");
@@ -158,6 +220,9 @@ void vka_imem_stats(char *o, size_t n) {
              (unsigned long long)S.blocks, S.blocks * (double)BLOCK / 1048576.0, (unsigned long long)S.freed, S.req_bytes / 1048576.0, (unsigned long long)S.runs,
              (S.run_bytes - S.req_bytes) / 1048576.0, (S.blocks * (double)BLOCK - S.run_bytes) / 1048576.0, (unsigned long long)S.ded, S.ded_bytes / 1048576.0);
     if (S.fail) { size_t l = strlen(o); snprintf(o + l, n - l, "; %llu block allocations failed (those images dedicated)", (unsigned long long)S.fail); }
+    if (S.pw_n || S.pw_fail) { size_t l = strlen(o);
+        snprintf(o + l, n - l, "; pool windows: %llu (%.0f MiB) hold %llu images of %.0f MiB (%llu windows not made)", (unsigned long long)S.pw_n, S.pw_bytes / 1048576.0,
+                 (unsigned long long)S.pw_imgs, S.pw_img_bytes / 1048576.0, (unsigned long long)S.pw_fail); }
     if (Z.made) { uint64_t zi, za, zb, zs; vkz_stats(&Z, &zi, &za, &zb, &zs); size_t l = strlen(o);
         snprintf(o + l, n - l, "; zero-shared: %llu images in %llu allocations (%.0f MiB, %.0f MiB saved), %llu made their own", (unsigned long long)zi, (unsigned long long)za, zb / 1048576.0, zs / 1048576.0, (unsigned long long)Z.owned); }
     pthread_mutex_unlock(&g_imu);

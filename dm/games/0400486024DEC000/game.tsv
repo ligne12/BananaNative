@@ -26,7 +26,7 @@ romfs_marker	Pack/Bootup.Nin_Ounce_NVN2.pack.zs
 zip_store	.zs:.bwav:.mc:.webm:.metallib
 
 # ---- Memory ----
-# Not measured yet. The NPDM declares 48 MB of system resource, so IsVirtualAddressMemoryEnabled is true and the game's memory lives in the alias region, as Mario Kart
+# Measured on the AYN Thor (2026-11-06): the game needs all of its 9 GB pool (README, "Resolved"). The NPDM declares 48 MB of system resource, so IsVirtualAddressMemoryEnabled is true and the game's memory lives in the alias region, as Mario Kart
 # World's (0400C3F00006E000/game.tsv, 64 MB): its layout until this game's own is known, with the Switch 2's 9 GB pool (the guessed Switch 1 pool, 3.2 GB, did not hold
 # Donkey Kong Bananza's heaps). 256 MB in front + 4 GB alias region + 256 MB stack region + the heap region
 mem_reserve	0x300000000

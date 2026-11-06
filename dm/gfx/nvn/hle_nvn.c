@@ -377,6 +377,14 @@ uint64_t nvn_pool_live(const void *pool, unsigned *flags, int *sparse) {
     if (g) { const pool_t *o = (const pool_t *)pool; if (flags) *flags = (unsigned)o->flags; if (sparse) *sparse = o->vp != NULL; }
     pthread_mutex_unlock(&g_pl_mu); return g;
 }
+// A live pool's memory, size and flags (the Vulkan replay's pool windows, vka_imgmem.c): its Initialize serial, or 0 (not live, or no pool)
+uint64_t nvn_pool_span(const void *pool, const uint8_t **mem, uint64_t *size, unsigned *flags) {
+    *mem = NULL; *size = 0; *flags = 0;
+    if (!pool) return 0;
+    pthread_mutex_lock(&g_pl_mu); plive *e = pl_find((const pool_t *)pool); uint64_t g = e ? e->gen : 0;
+    if (g) { const pool_t *o = (const pool_t *)pool; *mem = o->mem; *size = o->size; *flags = (unsigned)o->flags; }
+    pthread_mutex_unlock(&g_pl_mu); return g;
+}
 NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBuilder *b) {
     const pool_builder_t *s = (const pool_builder_t *)b; pool_t *o = (pool_t *)p;
     pthread_mutex_lock(&g_pl_mu);   // (a pool initialized again without a Finalize: readers see its new fields only with its new serial)
