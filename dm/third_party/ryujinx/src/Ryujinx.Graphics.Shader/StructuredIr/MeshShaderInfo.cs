@@ -52,6 +52,12 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
         // A mesh program's GL depth rewrite (IGpuAccessor.QueryMeshShaderGlDepthSpecId): the SpecId of its bool constant, -1 for none
         public int GlDepthSpecId { get; init; } = -1;
 
+        // Run as compute through the mesh emulation buffer (CodeGen/Spirv/SpirvMeshEmuEntry.cs), whose storage buffer binding the translator reserves
+        // (Translation/TranslatorContext.cs, GlobalToStorage.MeshEmuCbOffset)
+        public bool Emulated { get; init; }
+        public bool ReserveEmu { get; init; }
+        public int EmuBinding { get; set; } = -1;
+
         public int PayloadMemoryId { get; private set; } = -1;
         public int PlaneMemoryId { get; private set; } = -1;
         public int PrimitiveMemoryId { get; private set; } = -1;
@@ -163,7 +169,8 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
         {
             if (PayloadMemoryId < 0)
             {
-                PayloadMemoryId = properties.AddSharedMemory(new MemoryDefinition(PayloadName, AggregateType.Array | AggregateType.U32, PayloadWords));
+                // Emulated, the payload is plain workgroup memory: another name than the one Declarations.SharedStorageClass makes TaskPayloadWorkgroupEXT
+                PayloadMemoryId = properties.AddSharedMemory(new MemoryDefinition(Emulated ? PayloadName + "_emu" : PayloadName, AggregateType.Array | AggregateType.U32, PayloadWords));
             }
         }
 
@@ -180,7 +187,7 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
                 throw new NotSupportedException("a program cannot be both a task and a mesh program");
             }
 
-            return new MeshShaderInfo(task, gpuAccessor.QueryMeshShaderLayout()) { GlDepthSpecId = gpuAccessor.QueryMeshShaderGlDepthSpecId() };
+            return new MeshShaderInfo(task, gpuAccessor.QueryMeshShaderLayout()) { GlDepthSpecId = gpuAccessor.QueryMeshShaderGlDepthSpecId(), Emulated = gpuAccessor.QueryMeshShaderEmulated(), ReserveEmu = gpuAccessor.QueryMeshShaderEmuReserve() };
         }
     }
 }

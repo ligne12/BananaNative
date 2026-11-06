@@ -80,6 +80,8 @@
 #define DMSH_VK_KIND_GMEM_MAP 20         // gmem_map: the page table for raw global memory (DMSH_GMEM_PT_*; delta = buffer device address - guest address), STORAGE_BUFFER
 #define DMSH_VK_KIND_GMEM_LOG 21         // gmem_log: the write log of those stores, STORAGE_BUFFER, cleared per draw or dispatch
 #define DMSH_VK_KIND_SHARED_SPILL 22     // shared_spill: a compute program's shared memory past DMSH_VK_SHARED_MAX, STORAGE_BUFFER, the record's bytes per workgroup slice. Workgroup w
+#define DMSH_VK_KIND_MESH_EMU 23        // mesh_emu: a draw's region of the mesh emulation buffer (dmsh_abi.h DMSH_MESH_EMU_*), STORAGE_BUFFER; reg = max primitives, off = payload
+                                         // words, bytes = plane words a mesh workgroup, sreg = 1 for point primitives (task / mesh programs and their DMSH_VK_MOD_MESH_EMU* modules)
                                          // (linear index (z * groups y + y) * groups x + x) uses slice w mod (the bound range / bytes); slices not cleared (shared memory starts undefined)
 #define DMSH_VK_KIND_UNKNOWN 255         // ?: not placed; the replay refuses the shader
 
@@ -104,6 +106,9 @@
 #define DMSH_VK_MOD_UINT_MIXED 2         // only the targets of the entry's uint_mask as unsigned integers, the others float: for exactly those UINT attachments
 #define DMSH_VK_MOD_DUAL 3               // output 1 as Location 0 Index 1: for a pipeline blending target 0 with a SRC1 factor (dualSrcBlend); profile table dual_want.tsv
 #define DMSH_VK_MOD_SHUFFLE_LDS 4        // compute: its 32-bit subgroup shuffles through workgroup memory (vk_android_spv.py shuffle_lds), for a driver without an arbitrary-index
+#define DMSH_VK_MOD_MESH_EMU 5           // task / mesh: the program as compute through its DMSH_VK_KIND_MESH_EMU region, for a device without VK_EXT_mesh_shader
+#define DMSH_VK_MOD_MESH_EMU_VS 6        // mesh: the vertex shader that draws that region's primitives (Ryujinx SpirvMeshEmuVertex.cs), with the GL depth constant
+#define DMSH_VK_MOD_MESH_EMU_FLAT 7      // a pixel shader with per-primitive inputs, without PerPrimitiveEXT: drawn after the emulated mesh's vertex shader (its Flat outputs)
                                          // shuffle instruction (Turnip makes each one a loop); its workgroup memory, with the rows this adds, is at most DMSH_VK_SHARED_MAX bytes
 // How a module is stored: the SPIR-V words as they are, or one zstd frame of them (about a fifth of the size; the replay links zstd's decompressor)
 #define DMSH_VK_CODEC_RAW 0

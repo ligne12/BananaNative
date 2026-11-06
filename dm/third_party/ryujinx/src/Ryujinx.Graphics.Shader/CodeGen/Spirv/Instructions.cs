@@ -1935,6 +1935,15 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
                     IoVariable ioVariable = (IoVariable)varId.Value;
                     bool isOutput = storageKind.IsOutput();
                     bool isPerPatch = storageKind.IsPerPatch();
+
+                    // nxnative: an emulated task / mesh program reads its workgroup ID from the entry point's Private copy (SpirvMeshEmuEntry)
+                    if (ioVariable == IoVariable.CtaId && !isOutput && context.MeshEmuCtaId != null)
+                    {
+                        varType = AggregateType.U32;
+                        storageClass = StorageClass.Private;
+                        baseObj = context.MeshEmuCtaId;
+                        break;
+                    }
                     int location = 0;
                     int component = 0;
 

@@ -201,6 +201,16 @@ namespace Ryujinx.Graphics.Shader.Translation
             {
                 resourceManager.Properties.Mesh = mesh;
                 mesh.Declare(resourceManager.Properties);
+
+                if (mesh.Emulated || mesh.ReserveEmu)
+                {
+                    if (!resourceManager.TryGetStorageBufferBinding(GlobalToStorage.GmemMapCbSlot, GlobalToStorage.MeshEmuCbOffset, write: true, out int emuBinding))
+                    {
+                        throw new InvalidOperationException("no storage buffer binding is left for the mesh emulation buffer");
+                    }
+
+                    mesh.EmuBinding = emuBinding;
+                }
             }
 
             bool usesLocalMemory = _program.UsedFeatures.HasFlag(FeatureFlags.LocalMemory);

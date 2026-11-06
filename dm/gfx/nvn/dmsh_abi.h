@@ -91,6 +91,22 @@
 // StructuredIr/SharedSpillInfo.cs): one slice per workgroup (dmsh_abi_vk.h DMSH_VK_KIND_SHARED_SPILL). The Apple build never sets shared_max (dmsh_build.py shared_spill instead)
 #define DMSH_KIND_SHARED_SPILL "shared_spill"
 #define DMSH_SHARED_SPILL_CB_OFFSET 2
+// Android Vulkan only: an NVN2 task / mesh program run as compute on a device without VK_EXT_mesh_shader (Ryujinx CodeGen/Spirv/SpirvMeshEmuEntry.cs), and the vertex shader
+// that draws a mesh program's output (SpirvMeshEmuVertex.cs): one buffer region a draw, reserved under the same slot at offset 3 (GlobalToStorage.MeshEmuCbOffset). The
+// translation of every task / mesh program reserves it, so the native module and its emulated variants have the same bindings (dmsh_abi_vk.h DMSH_VK_KIND_MESH_EMU)
+#define DMSH_KIND_MESH_EMU "mesh_emu"
+#define DMSH_MESH_EMU_CB_OFFSET 3
+// The region's header, 32-bit words: the mesh dispatch's indirect arguments (x counted by the tasks), the draw's (vertexCount raised by the mesh workgroups), the capacity in
+// workgroups, the first workgroup, the word offsets of the payloads, planes and indices, whether a task launches the meshes, then from word 16 a (task, rank) pair a mesh workgroup
+#define DMSH_MESH_EMU_DISPATCH 0
+#define DMSH_MESH_EMU_DRAW 4
+#define DMSH_MESH_EMU_CAPACITY 8
+#define DMSH_MESH_EMU_FIRST 9
+#define DMSH_MESH_EMU_PAYLOADS 10
+#define DMSH_MESH_EMU_PLANES 11
+#define DMSH_MESH_EMU_INDICES 12
+#define DMSH_MESH_EMU_HAS_TASK 13
+#define DMSH_MESH_EMU_LIST 16
 
 // A pool binding points at a buffer the host keeps (nvn_mtl.m pool_gpu): a 32-bit bound n (the highest index the shader may read), then from DMSH_POOL_HEAD one 8-byte resource ID per ID
 #define DMSH_POOL_HEAD 8                 // bytes before element 0 of a pool buffer

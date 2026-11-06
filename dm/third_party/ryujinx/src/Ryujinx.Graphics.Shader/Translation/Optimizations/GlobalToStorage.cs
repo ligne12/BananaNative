@@ -825,6 +825,9 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
         // nxnative: the shared memory spill buffer (StructuredIr/SharedSpillInfo.cs, dmsh_abi.h DMSH_SHARED_SPILL_CB_OFFSET), reserved under the same sentinel slot at offset 2
         public const int SharedSpillCbOffset = 2;
+
+        // nxnative: an emulated task / mesh program's buffer (dmsh_abi.h DMSH_KIND_MESH_EMU, CodeGen/Spirv/SpirvMeshEmuEntry.cs)
+        public const int MeshEmuCbOffset = 3;
         private const int GmemLogLog2 = 10;
         private const int GmemLogProbes = 8;
 

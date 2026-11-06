@@ -21,6 +21,7 @@
 //           "shared_spill": {"bytes", "workgroup"} when the shared memory moved to a storage buffer (job shared_max); "fetch1d": the texture slots read by 1D integer fetches translated as wrapped 2D reads, see RecordTexelFetch1D)
 using Ryujinx.Common.Memory;
 using Ryujinx.Graphics.Shader;
+using Ryujinx.Graphics.Shader.CodeGen.Spirv;
 using Ryujinx.Graphics.Shader.Translation;
 using System;
 using System.Collections.Generic;
@@ -79,6 +80,8 @@ static class SwshXlate
         // A task / mesh program's layout (job "mesh", see the file header) and its GL depth constant
         public int[] QueryMeshShaderLayout() => _job["mesh"] is JsonArray m ? m.Select(v => (int)v).ToArray() : null;
         public int QueryMeshShaderGlDepthSpecId() => _job["gl_depth_spec"] is JsonNode n ? (int)n : -1;
+        public bool QueryMeshShaderEmulated() => _job["mesh_emu"] is JsonNode n && (bool)n;
+        public bool QueryMeshShaderEmuReserve() => _job["mesh_emu_reserve"] is JsonNode n && (bool)n;
         public uint ConstantBuffer1Read(int offset) { if (offset >= 0 && offset + 4 <= _c1.Length) return BitConverter.ToUInt32(_c1, offset); Notes.Add($"c1 read out of bounds +{offset:X} (c1 length {_c1.Length})"); return 0; }
         // All resources go into set 0, each with a distinct binding number (spirv-cross emits them as one argument buffer); the translator's convention of giving the buffer of constant segment number index binding = index+1 is not relied on
         // The translator's own messages (a bindless read it resolved, or could not and removed, its result 0; an invalid encoding) go into the notes, marked, which dmsh_build.py counts apart
@@ -234,6 +237,22 @@ static class SwshXlate
             string key = (string)job["key"];
             try
             {
+                // nxnative: an emulated mesh program's vertex shader (Ryujinx CodeGen/Spirv/SpirvMeshEmuVertex.cs), generated from the mesh program's layout: no code
+                if (job["mesh_emu_vs"] is JsonArray emuLayout)
+                {
+                    int[] lay = emuLayout.Select(v => (int)v).ToArray();
+                    File.WriteAllBytes(Path.Combine(outDir, key + ".spv"), SpirvMeshEmuVertex.Generate(lay, out int[] vl, out int[] pl));
+                    var vres = new JsonObject
+                    {
+                        ["key"] = key, ["stage"] = "vs", ["notes"] = new JsonArray(), ["cbufs"] = new JsonArray(), ["textures"] = new JsonArray(), ["images"] = new JsonArray(),
+                        ["sbufs"] = new JsonArray(new JsonObject { ["binding"] = SpirvMeshEmuVertex.Binding, ["slot"] = 0, ["cb_slot"] = 255, ["cb_offset"] = 3, ["flags"] = 0 }),
+                        ["geometry_stride"] = 0, ["uses_frag_coord"] = false, ["frag_out_map"] = 0,
+                        ["mesh_emu_vs"] = new JsonObject { ["vertex_locations"] = new JsonArray(vl.Select(v => (JsonNode)v).ToArray()), ["primitive_locations"] = new JsonArray(pl.Select(v => (JsonNode)v).ToArray()) },
+                    };
+                    File.WriteAllText(Path.Combine(outDir, key + ".res.json"), vres.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+                    ok++;
+                    continue;
+                }
                 byte[] code = File.ReadAllBytes((string)job["code"]);
                 var acc = new Accessor(code, job);
                 // Job debug = false: turn off DebugMode (DebugMode skips the AST optimizer and the output is full of temporaries; semantics unchanged)
@@ -271,6 +290,11 @@ static class SwshXlate
                     ["uses_frag_coord"] = p.Info.UsesFragCoord, ["frag_out_map"] = p.Info.FragmentOutputMap,
                 };
                 if ((string)job["stage"] == "ms") res["mesh"] = MeshOutputs(job["mesh"].AsArray().Select(v => (int)v).ToArray());
+                if ((job["mesh_emu"] is JsonNode me && (bool)me) || (job["mesh_emu_reserve"] is JsonNode mr && (bool)mr))   // the sizes the host lays a draw's region out with
+                {
+                    var l = SpirvMeshEmuVertex.Layout((string)job["stage"] == "ts", job["mesh"].AsArray().Select(v => (int)v).ToArray());
+                    res["mesh_emu"] = new JsonObject { ["plane_words"] = l.PlaneWords, ["payload_words"] = l.PayloadWords, ["max_vertices"] = l.MaxVertices, ["max_primitives"] = l.MaxPrimitives, ["points"] = l.Points };
+                }
                 foreach (var b in p.Info.CBuffers) res["cbufs"].AsArray().Add(new JsonObject { ["binding"] = b.Binding, ["slot"] = b.Slot });
                 foreach (var b in p.Info.SBuffers) res["sbufs"].AsArray().Add(new JsonObject { ["binding"] = b.Binding, ["slot"] = b.Slot, ["cb_slot"] = b.SbCbSlot, ["cb_offset"] = b.SbCbOffset, ["flags"] = (int)b.Flags });
                 foreach (var (list, name) in new[] { (p.Info.Textures, "textures"), (p.Info.Images, "images") })

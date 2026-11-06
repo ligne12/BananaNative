@@ -21,9 +21,9 @@ import dmsh_abi as abi   # noqa: E402
 # a single texture bind record's flag bit in nvn_obj.h (BIND_TEX1_NOBASE) and its p_draw.prim of an NVN2 mesh-task draw (NVN_PRIM_MESH).
 # 0x1000 where it is not the pool table's entry count (DMSH_GMEM_MAP_ENTRIES): the 4 KB page step of nvn_mtl.m's sparse residency map.
 # A count may only go down; when it does, lower it here.
-# Binding kinds only the Android build writes: the Apple build never answers the translator's shared_max (dmsh_abi.h), so its
-# shaders never have them. Checked against vk_android_build.py and vka_bind.c instead of dmsh_build.py and nvn_refl.m.
-ANDROID_ONLY_KINDS = ('KIND_SHARED_SPILL',)
+# Binding kinds only the Android build writes: the Apple build never answers the translator's shared_max nor asks for the mesh emulation
+# region (job mesh_emu / mesh_emu_reserve; dmsh_abi.h), so its shaders never have them. Checked against vk_android_build.py and vka_bind.c instead of dmsh_build.py and nvn_refl.m.
+ANDROID_ONLY_KINDS = ('KIND_SHARED_SPILL', 'KIND_MESH_EMU')
 
 BASELINE = {
     'dm/gfx/nvn/nvn_mtl.m': {"'?'": 2, "'geometry'": 3, '0x100': 2, '0x1000': 2},

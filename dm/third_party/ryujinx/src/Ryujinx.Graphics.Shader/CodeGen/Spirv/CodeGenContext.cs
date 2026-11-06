@@ -48,6 +48,9 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
         // nxnative: shared memory in a storage buffer (StructuredIr/SharedSpillInfo.cs): the Private word holding this workgroup's slice base (set at the start of main), and
         // the NumWorkgroups input declared for it (Declarations.DeclareSharedSpill)
         public Instruction SharedSpillBase { get; set; }
+
+        // nxnative: an emulated task / mesh program's workgroup ID, a Private uvec3 its entry point fills (SpirvMeshEmuEntry); null otherwise
+        public Instruction MeshEmuCtaId { get; set; }
         public List<Instruction> ExtraInterface { get; } = [];
         private readonly Dictionary<AstOperand, Instruction> _locals = new();
         private readonly Dictionary<int, Instruction> _funcArgs = new();

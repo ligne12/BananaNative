@@ -52,6 +52,20 @@ namespace Ryujinx.Graphics.Shader
         /// nxnative: the SpecId of a bool specialization constant under which a Switch 2 mesh program rewrites its positions' depth to the GL convention
         /// (z' = z / 2 + w / 2, near = -w, NVN's default) before it hands them over; -1 for none.
         /// </summary>
+        // nxnative: whether a task / mesh program runs as compute through the mesh emulation buffer (job "mesh_emu", CodeGen/Spirv/SpirvMeshEmuEntry.cs), for a device
+        // without VK_EXT_mesh_shader
+        bool QueryMeshShaderEmulated()
+        {
+            return false;
+        }
+
+        // nxnative: whether a task / mesh program reserves the mesh emulation buffer's binding though it runs natively (job "mesh_emu_reserve": the Android library, whose
+        // native module and emulated variants share one binding list)
+        bool QueryMeshShaderEmuReserve()
+        {
+            return false;
+        }
+
         int QueryMeshShaderGlDepthSpecId()
         {
             return -1;

@@ -383,7 +383,7 @@ for _p in [p for p in MESH_PRIM if VS_OF.get(p)]:
 KIND = {abi.KIND_CBUF: 'CBUF', abi.KIND_C1: 'C1', abi.KIND_DRVCB: 'DRVCB', abi.KIND_SUPPORT: 'SUPPORT', abi.KIND_SBUF: 'SBUF', abi.KIND_SBUF_UBO: 'SBUF_UBO', abi.KIND_UBO_PTR: 'UBO_PTR',
         abi.KIND_TEX: 'TEX', abi.KIND_TBUF: 'TBUF', abi.KIND_IMG: 'IMG', abi.KIND_SAMP: 'SAMP', abi.KIND_SAMP_TEX: 'SAMP_TEX', abi.KIND_SAMP_ID: 'SAMP_ID', abi.KIND_TEX_UBO: 'TEX_UBO',
         abi.KIND_SAMP_UBO: 'SAMP_UBO', abi.KIND_TEX_C2A: 'TEX_C2A', abi.KIND_SAMP_C2A: 'SAMP_C2A', abi.KIND_TEX_POOL: 'TEX_POOL', abi.KIND_SAMP_POOL: 'SAMP_POOL',
-        abi.KIND_GMEM_MAP: 'GMEM_MAP', abi.KIND_GMEM_LOG: 'GMEM_LOG', abi.KIND_SHARED_SPILL: 'SHARED_SPILL', abi.KIND_UNKNOWN: 'UNKNOWN'}
+        abi.KIND_GMEM_MAP: 'GMEM_MAP', abi.KIND_GMEM_LOG: 'GMEM_LOG', abi.KIND_SHARED_SPILL: 'SHARED_SPILL', abi.KIND_MESH_EMU: 'MESH_EMU', abi.KIND_UNKNOWN: 'UNKNOWN'}
 KIND_NUM = {k: VK['KIND_' + v] for k, v in KIND.items()}
 SLOT_KINDS = {abi.KIND_CBUF, abi.KIND_SAMP, abi.KIND_SAMP_TEX, abi.KIND_TEX, abi.KIND_IMG, abi.KIND_TBUF, abi.KIND_SBUF, abi.KIND_UBO_PTR, abi.KIND_SBUF_UBO, abi.KIND_TEX_UBO, abi.KIND_SAMP_UBO, abi.KIND_SAMP_ID}
 POOL_SUFFIX = '_cb0_40000000'   # a handle traced to no slot indexes the pools by its IDs (Program.cs QueryTextureArrayLengthFromPool; dmsh_build.py pool_arrays)
@@ -451,6 +451,8 @@ def storage_slots(stage, binds, res):
         off = b['cb_offset'] * 4 if b and b['cb_slot'] == 0 else None
         if b and b['cb_slot'] == abi.GMEM_MAP_CB_SLOT and b['cb_offset'] == abi.SHARED_SPILL_CB_OFFSET:   # shared memory past ANSWERS shared_max (dmsh_abi_vk.h)
             e.update(kind=abi.KIND_SHARED_SPILL, flags=e['flags'] | VK['BF_RW']); continue
+        if b and b['cb_slot'] == abi.GMEM_MAP_CB_SLOT and b['cb_offset'] == abi.MESH_EMU_CB_OFFSET:   # an emulated task / mesh program's region (dmsh_abi.h DMSH_KIND_MESH_EMU)
+            e.update(kind=abi.KIND_MESH_EMU, flags=e['flags'] | (VK['BF_RW'] if stage != 'vs' else 0)); continue
         if b and b['cb_slot'] == abi.GMEM_MAP_CB_SLOT:
             e['kind'] = abi.KIND_GMEM_LOG if b['cb_offset'] == abi.GMEM_LOG_CB_OFFSET else abi.KIND_GMEM_MAP
             if e['kind'] == abi.KIND_GMEM_LOG or any(re.search(r'operation "(Store|Atomic\w*)" traced to no storage buffer', n) for n in res.get('notes', ())): e['flags'] |= VK['BF_RW']
@@ -574,6 +576,11 @@ def finish(key, w, job, c1):
     hmma = stage == 'cs' and spv.hmma_lds(m)   # the HMMA helper's calls lowered at their sites, gathers shared (vk_android_spv.py hmma_lds)
     binds = [classify(stage, r, res, m) for r in m.resources()]
     storage_slots(stage, binds, res)
+    me = res.get('mesh_emu')   # the region's sizes, in its binding record (dmsh_abi_vk.h DMSH_VK_KIND_MESH_EMU)
+    for e in binds:
+        if e['kind'] == abi.KIND_MESH_EMU:
+            if not me: e['kind'] = abi.KIND_UNKNOWN; continue
+            e.update(reg=me['max_primitives'], off=me['payload_words'], bytes=me['plane_words'], sreg=1 if me['points'] else 0)
     try: place(stage, binds, m)
     except ValueError as e: return 'reflection failed', str(e)[:160], None
     pad = []
@@ -581,6 +588,7 @@ def finish(key, w, job, c1):
         want_in = set().union(*[PS_INPUTS.get(p, set()) for p in PAIRS.get(key, ())]) if PAIRS.get(key) else set()
         pad = spv.init_outputs(m, want_in)
     elif stage == 'ps': PS_INPUTS[key] = set(m.io(spv.SC_INPUT))
+    flat = m.data() if stage == 'ps' and key in MESH_PRIM else None   # before PerPrimitiveEXT: DMSH_VK_MOD_MESH_EMU_FLAT
     prim = spv.per_primitive_inputs(m, MESH_PRIM[key]) if stage == 'ps' and key in MESH_PRIM else []
     gl = stage in ('vs', 'ds', 'gs') and spv.gl_depth(m, VK['SPEC_GL_DEPTH'])
     if stage == 'ms':   # the translator adds the constant itself (job gl_depth_spec: a mesh program may not read its outputs back)
@@ -594,6 +602,26 @@ def finish(key, w, job, c1):
     if stage == 'cs':   # its subgroup shuffles through workgroup memory, for drivers without an arbitrary-index shuffle instruction (vk_android_spv.py shuffle_lds)
         x = spv.Module(m.data())
         if spv.shuffle_lds(x, VK['SHARED_MAX']): mods.append((VK['MOD_SHUFFLE_LDS'], x.data()))
+    if flat:   # with the alpha test the base module gets below
+        fx = spv.Module(flat); spv.alpha_test(fx, VK['SPEC_ALPHA_FUNC']); mods.append((VK['MOD_MESH_EMU_FLAT'], fx.data()))
+    if stage in ('ts', 'ms'):   # the program as compute and a mesh program's vertex shader, for a device without VK_EXT_mesh_shader (Ryujinx SpirvMeshEmuEntry.cs / SpirvMeshEmuVertex.cs)
+        emu = [(VK['MOD_MESH_EMU'], dict({kk: v for kk, v in job.items() if kk != 'gl_depth_spec'}, key=key + '_emu', mesh_emu=True))]
+        if stage == 'ms': emu.append((VK['MOD_MESH_EMU_VS'], {'key': key + '_emuvs', 'stage': 'vs', 'mesh_emu_vs': job['mesh']}))
+        for variant, ej in emu:
+            rx = translate([ej], w, ej['key'])
+            ep = os.path.join(w, ej['key'] + '.spv')
+            if rx.returncode or not os.path.exists(ep): return 'translation failed', (f'mesh emulation module {variant}: ' + rx.stderr.strip())[:160], None
+            x = spv.Module(open(ep, 'rb').read())
+            spv.strip_unused_caps(x); spv.formatless_storage_caps(x); spv.precise_minmax(x)
+            # The entry's placed bindings (place() wrote them into the base module only): the compute module declares the base module's resources (the same
+            # translation, the region's binding reserved first in both), by the translator's binding; the vertex shader declares only the region
+            for r in x.resources():
+                if variant == VK['MOD_MESH_EMU_VS']: rec = next((e for e in binds if e['kind'] == abi.KIND_MESH_EMU), None)
+                else: rec = next((e for e in binds if e['tbind'] == r['binding'] and e['desc'] == r['desc']), None)
+                if rec is None: return 'reflection failed', f'mesh emulation module {variant}: binding {r["binding"]} ({r["name"]}) is not in the base module', None
+                x.set_binding(r['id'], rec['set'], rec['binding'])
+            if variant == VK['MOD_MESH_EMU_VS']: spv.gl_depth(x, VK['SPEC_GL_DEPTH'])
+            mods.append((variant, x.data()))
     for variant, data in mods:
         err = validate(data, w, f'{key}_{variant}')
         if err: return 'spirv-val failed', err, None
@@ -882,6 +910,7 @@ def run_batch(batch):
         jobs[key], c1s[key] = NS['job_for'](key, name, _rec(name, k), bd)
         jobs[key].update(ANSWERS)
         if STAGE_OF[key] == 'ms': jobs[key]['gl_depth_spec'] = VK['SPEC_GL_DEPTH']
+        if STAGE_OF[key] in ('ts', 'ms'): jobs[key]['mesh_emu_reserve'] = True   # the region's binding, also in the native module (its emulated variants have the same bindings)
     r = translate([jobs[k] for k in batch], bd, batch[0])
     xerr = {}
     for ln in r.stderr.splitlines():

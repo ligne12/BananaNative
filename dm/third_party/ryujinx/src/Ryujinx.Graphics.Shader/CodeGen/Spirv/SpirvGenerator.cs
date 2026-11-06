@@ -165,15 +165,28 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
                 context.DeclareFunction(funcIndex, function, spvFunc);
             }
 
+            // nxnative: an emulated task / mesh program's workgroup ID, before the body reads it (SpirvMeshEmuEntry.cs)
+            if (context.Properties.Mesh is { Emulated: true })
+            {
+                SpirvMeshEmuEntry.DeclareCtaId(context);
+            }
+
             for (int funcIndex = 0; funcIndex < info.Functions.Count; funcIndex++)
             {
                 Generate(context, info, funcIndex);
             }
 
-            // nxnative: a Switch 2 task / mesh program's entry point wraps function 0 (SpirvMeshEntry.cs)
+            // nxnative: a Switch 2 task / mesh program's entry point wraps function 0 (SpirvMeshEntry.cs; as compute without VK_EXT_mesh_shader: SpirvMeshEmuEntry.cs)
             if (context.Properties.Mesh != null)
             {
-                SpirvMeshEntry.Generate(context, context.Properties.Mesh);
+                if (context.Properties.Mesh.Emulated)
+                {
+                    SpirvMeshEmuEntry.Generate(context, context.Properties.Mesh);
+                }
+                else
+                {
+                    SpirvMeshEntry.Generate(context, context.Properties.Mesh);
+                }
             }
 
             byte[] result = context.Generate();
