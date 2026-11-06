@@ -421,7 +421,10 @@ namespace Ryujinx.Graphics.Shader.Translation
                 {
                     Operand label;
 
-                    if (opIndex == block.OpCodes.Count - 1 && block.HasNext())
+                    // The block ends with CommitAll: a guarded last instruction that skipped straight to the successor skipped it too, and the deferred writes of
+                    // earlier variable-latency instructions (or its own) were lost on that path (Ocarina of Time's title text: @!P0 ALD R85 then @P0 FFMA R85 last
+                    // in its block, the glyph quads' corner y lost whichever ran). With writes pending the skip lands before CommitAll, as for any other instruction
+                    if (opIndex == block.OpCodes.Count - 1 && block.HasNext() && writeBarrier >= 6 && Array.TrueForAll(pending, p => p == null))
                     {
                         label = context.GetLabel(block.Successors[0].Address);
                     }
@@ -458,9 +461,55 @@ namespace Ryujinx.Graphics.Shader.Translation
                 {
                     DeferAmpereWrites(context, opStart, pending, writeBarrier, ref shadows, freeShadows);
                 }
+                else
+                {
+                    ShadowFixedWrites(context, opStart, pending);
+                }
             }
 
             CommitAll();
+        }
+
+        // A register with a deferred write pending that a later fixed-latency instruction writes: the shadow takes the value too, under the same guard, so that the
+        // commit keeps it. The two writes are exclusive by their guards (else the hardware itself would race): Ocarina of Time's title text, @!P0 ALD R85 then
+        // @P0 FFMA R85 before the barrier's wait; the commit of the ALD's shadow (the old R85 when it did not run) overwrote the FFMA's result
+        private static void ShadowFixedWrites(EmitterContext context, int opStart, List<(Register Reg, Operand Value)>[] pendingAll)
+        {
+            Dictionary<Register, Operand> shadow = new();
+
+            foreach (List<(Register Reg, Operand Value)> list in pendingAll)
+            {
+                if (list != null)
+                {
+                    foreach ((Register reg, Operand value) in list)
+                    {
+                        shadow[reg] = value;
+                    }
+                }
+            }
+
+            if (shadow.Count == 0)
+            {
+                return;
+            }
+
+            for (int i = opStart; i < context.OperationsCount; i++)
+            {
+                Operation operation = context.GetOperation(i);
+                int at = i;
+
+                for (int d = 0; d < operation.DestsCount; d++)
+                {
+                    Operand dest = operation.GetDest(d);
+
+                    if (dest != null && dest.Type == OperandType.Register && shadow.TryGetValue(dest.GetRegister(), out Operand local))
+                    {
+                        context.InsertOperation(++at, new Operation(Instruction.Copy, local, Register(dest.GetRegister())));
+                    }
+                }
+
+                i = at;
+            }
         }
 
         // The registers written by the operations from opStart on become shadow registers (every use in the range too), each first set to the register's value
