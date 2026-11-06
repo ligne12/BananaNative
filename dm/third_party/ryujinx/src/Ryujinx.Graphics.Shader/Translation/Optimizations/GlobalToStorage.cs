@@ -82,6 +82,24 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                 _hfm = hfm;
             }
 
+            // nxnative: the helpers of grouped raw loads (TryGroupRawLoads), by their words' byte offsets from the first
+            public readonly Dictionary<string, int> RawGroups = new();
+
+            public int AddRawGroup(string key, Function function)
+            {
+                int functionId = _hfm.AddFunction(function);
+
+                RawGroups[key] = functionId;
+
+                return functionId;
+            }
+
+            // nxnative: whether functionId is the helper of a raw global access (TryGenerateRawStorageOp: no target buffer)
+            public bool IsRawFunction(int functionId)
+            {
+                return _entries.Exists(entry => entry.FunctionId == functionId && entry.IsMultiTarget && entry.TargetCbs.Count == 0);
+            }
+
             public int AddFunction(Operation baseOp, bool isMultiTarget, IReadOnlyList<uint> targetCbs, Function function)
             {
                 int functionId = _hfm.AddFunction(function);
@@ -384,6 +402,11 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                     out int functionId))
                 {
                     return null;
+                }
+
+                if (TryGroupRawLoads(gtsContext, resourceManager, gpuAccessor, node, operation, functionId))
+                {
+                    return node;
                 }
 
                 return GenerateCallStorageOp(node, operation, null, functionId);
@@ -872,15 +895,7 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                 // level 2 array (0: the null block), whose two words for each 4 KiB page are the pool's delta with bit 0 set, or 0 outside every pool. Three loads an access,
                 // with no loop and no per-invocation state. The search below (12 steps and the pool cache) made one Ocarina of Time vertex shader with 253 accesses 50,769
                 // instructions long once Turnip had inlined each, about half of them branches; its two draws took 21 ms of a frame's 40 ms of GPU on the AYN Thor
-                Operand inSpace = context.ICompareLessUnsigned(addrHigh, Const(1 << (GmemPtVaBits - 32)));
-                Operand l1 = context.ConditionalSelect(inSpace, context.BitwiseOr(context.ShiftLeft(addrHigh, Const(32 - GmemPtBlockLog2)), context.ShiftRightU32(addrLow, Const(GmemPtBlockLog2))), Const(0));
-                Operand block = MapWord(l1, GmemPtL1Word);
-                Operand page = context.BitwiseAnd(context.ShiftRightU32(addrLow, Const(GmemPtPageLog2)), Const((1 << (GmemPtBlockLog2 - GmemPtPageLog2)) - 1));
-                Operand pageEntry = context.IAdd(block, context.ShiftLeft(page, Const(1)));
-                Operand ptLow = MapWord(pageEntry, 0);
-                context.Copy(deltaHigh, MapWord(pageEntry, 1));
-                context.BranchIfFalse(lblSkip, context.ICompareNotEqual(context.BitwiseAnd(ptLow, Const(1)), Const(0)));
-                context.Copy(deltaLow, context.BitwiseAnd(ptLow, Const(~1)));
+                EmitPageTableLookup(context, mapBinding, addrLow, addrHigh, deltaLow, deltaHigh, lblSkip);
             }
             else
             {
@@ -1066,6 +1081,230 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             functionId = gtsContext.AddFunction(operation, isMultiTarget: true, [], function);
 
             return true;
+        }
+
+        // nxnative: the Android host's page table lookup of the address (addrLow, addrHigh): its pool's delta into deltaLow / deltaHigh, or a branch to lblSkip outside
+        // every pool. Three loads, with no loop and no per-invocation state (dmsh_abi.h DMSH_GMEM_PT_*)
+        private static void EmitPageTableLookup(EmitterContext context, int mapBinding, Operand addrLow, Operand addrHigh, Operand deltaLow, Operand deltaHigh, Operand lblSkip)
+        {
+            Operand MapWord(Operand entry, int word)
+            {
+                return context.Load(StorageKind.StorageBuffer, mapBinding, Const(0), context.IAdd(entry, Const(word)));
+            }
+
+            Operand inSpace = context.ICompareLessUnsigned(addrHigh, Const(1 << (GmemPtVaBits - 32)));
+            Operand l1 = context.ConditionalSelect(inSpace, context.BitwiseOr(context.ShiftLeft(addrHigh, Const(32 - GmemPtBlockLog2)), context.ShiftRightU32(addrLow, Const(GmemPtBlockLog2))), Const(0));
+            Operand block = MapWord(l1, GmemPtL1Word);
+            Operand page = context.BitwiseAnd(context.ShiftRightU32(addrLow, Const(GmemPtPageLog2)), Const((1 << (GmemPtBlockLog2 - GmemPtPageLog2)) - 1));
+            Operand pageEntry = context.IAdd(block, context.ShiftLeft(page, Const(1)));
+            Operand ptLow = MapWord(pageEntry, 0);
+            context.Copy(deltaHigh, MapWord(pageEntry, 1));
+            context.BranchIfFalse(lblSkip, context.ICompareNotEqual(context.BitwiseAnd(ptLow, Const(1)), Const(0)));
+            context.Copy(deltaLow, context.BitwiseAnd(ptLow, Const(~1)));
+        }
+
+        // nxnative: the words of one vector load share one page table lookup. The Ampere frontend emits LDG.64 / LDG.128 as a 32-bit load a word, at the same base plus
+        // 4, 8 and 12 (InstEmitAmpereMem.ALdg); through the raw path each word made its own lookup, two dependent loads before its own. The loads of a block at one base
+        // (an address or that address plus a constant, with its carry) within 16 bytes of each other, with no memory write between, become one call: the helper looks
+        // the first word's page up and reads every word with that pool's delta. Words that close are in one pool, which is contiguous on both sides. Ocarina of Time's
+        // vertex shader 4671e5e647fc5455 reads 58 LDG.128 of light probe data a vertex: 232 lookups before, 58 after
+        private static bool TryGroupRawLoads(
+            GtsContext gtsContext,
+            ResourceManager resourceManager,
+            IGpuAccessor gpuAccessor,
+            LinkedListNode<INode> node,
+            Operation operation,
+            int functionId)
+        {
+            if (!gpuAccessor.QueryGmemPageTable() ||
+                operation.Inst != Instruction.Load ||
+                operation.StorageKind != StorageKind.GlobalMemory ||
+                operation.Dest == null ||
+                operation.SourcesCount != 2 ||
+                !gtsContext.IsRawFunction(functionId))
+            {
+                return false;
+            }
+
+            List<(Operation Op, LinkedListNode<INode> Node, int Delta)> best = null;
+
+            foreach ((Operand baseLow, Operand baseHigh, int baseOffset) in BaseCandidates(operation.GetSource(0), operation.GetSource(1)))
+            {
+                List<(Operation Op, LinkedListNode<INode> Node, int Delta)> members = [(operation, node, 0)];
+                int min = 0;
+                int max = 0;
+                int scanned = 0;
+
+                for (LinkedListNode<INode> next = node.Next; next != null && scanned < 48; next = next.Next, scanned++)
+                {
+                    if (next.Value is not Operation other)
+                    {
+                        continue;
+                    }
+
+                    if (other.Inst == Instruction.Load && other.StorageKind == StorageKind.GlobalMemory && other.Dest != null && other.SourcesCount == 2)
+                    {
+                        foreach ((Operand low, Operand high, int offset) in BaseCandidates(other.GetSource(0), other.GetSource(1)))
+                        {
+                            if (low == baseLow && high == baseHigh)
+                            {
+                                int delta = offset - baseOffset;
+
+                                if (Math.Max(max, delta) - Math.Min(min, delta) < 16 && !members.Exists(member => member.Delta == delta))
+                                {
+                                    members.Add((other, next, delta));
+                                    min = Math.Min(min, delta);
+                                    max = Math.Max(max, delta);
+                                }
+
+                                break;
+                            }
+                        }
+
+                        continue;
+                    }
+
+                    Instruction inst = other.Inst & Instruction.Mask;
+
+                    if (inst == Instruction.Store || inst == Instruction.Call || inst == Instruction.Barrier || inst == Instruction.MemoryBarrier ||
+                        inst == Instruction.GroupMemoryBarrier || other.Inst.IsAtomic())
+                    {
+                        break;
+                    }
+                }
+
+                if (members.Count > 1 && (best == null || members.Count > best.Count))
+                {
+                    best = members;
+                }
+            }
+
+            if (best == null || !resourceManager.TryGetStorageBufferBinding(GmemMapCbSlot, 0, write: false, out int mapBinding))
+            {
+                return false;
+            }
+
+            string key = string.Join(",", best.ConvertAll(member => member.Delta));
+
+            if (!gtsContext.RawGroups.TryGetValue(key, out int groupId))
+            {
+                EmitterContext context = new();
+
+                Operand addrLow = Argument(0);
+                Operand addrHigh = Argument(1);
+                Operand deltaLow = Local();
+                Operand deltaHigh = Local();
+                Operand lblSkip = Label();
+
+                EmitPageTableLookup(context, mapBinding, addrLow, addrHigh, deltaLow, deltaHigh, lblSkip);
+
+                Operand hostLow = context.IAdd(addrLow, deltaLow);
+                Operand hostHigh = context.IAdd(context.IAdd(addrHigh, deltaHigh), context.ConditionalSelect(context.ICompareLessUnsigned(hostLow, addrLow), Const(1), Const(0)));
+                Operand first = null;
+
+                for (int index = 0; index < best.Count; index++)
+                {
+                    int delta = best[index].Delta;
+                    Operand wordLow = hostLow;
+                    Operand wordHigh = hostHigh;
+
+                    if (delta != 0)
+                    {
+                        wordLow = context.IAdd(hostLow, Const(delta));
+                        wordHigh = context.IAdd(hostHigh, delta > 0
+                            ? context.ConditionalSelect(context.ICompareLessUnsigned(wordLow, hostLow), Const(1), Const(0))
+                            : context.ConditionalSelect(context.ICompareGreaterUnsigned(wordLow, hostLow), Const(-1), Const(0)));
+                    }
+
+                    Operand value = context.Load(StorageKind.GlobalMemory, wordLow, wordHigh);
+
+                    if (index == 0)
+                    {
+                        first = value;
+                    }
+                    else
+                    {
+                        context.Copy(Argument(1 + index), value);
+                    }
+                }
+
+                context.Return(first);
+                context.MarkLabel(lblSkip);
+
+                for (int index = 1; index < best.Count; index++)
+                {
+                    context.Copy(Argument(1 + index), Const(0));
+                }
+
+                context.Return(Const(0));
+
+                Function function = new(
+                    ControlFlowGraph.Create(context.GetOperations()).Blocks,
+                    "LoadGlobalRawGroup_" + key.Replace(",", "_").Replace("-", "m"),
+                    true,
+                    2,
+                    best.Count - 1);
+
+                groupId = gtsContext.AddRawGroup(key, function);
+            }
+
+            Operand[] dests = new Operand[best.Count];
+
+            for (int index = 0; index < dests.Length; index++)
+            {
+                dests[index] = Local();
+            }
+
+            Operation callOp = new(Instruction.Call, 0, dests, [Const(groupId), operation.GetSource(0), operation.GetSource(1)]);
+
+            node.List.AddBefore(node, callOp);
+
+            // The first load becomes a copy where it is (the pass goes on after it); the others are replaced by plain copies, since an operation turned into a copy keeps
+            // its storage kind and the pass would take it for a global access when it reaches it
+            operation.TurnIntoCopy(dests[0]);
+
+            for (int index = 1; index < best.Count; index++)
+            {
+                (Operation other, LinkedListNode<INode> otherNode, _) = best[index];
+                Operand dest = other.Dest;
+
+                other.Dest = null;
+                otherNode.List.AddBefore(otherNode, new Operation(Instruction.Copy, dest, dests[index]));
+                Utils.DeleteNode(otherNode, other);
+            }
+
+            return true;
+        }
+
+        // The bases an address (low, high) can be read at: itself at offset 0, and, when its low word is a sum with a constant whose carry goes into the high word
+        // (InstEmitAmpereMem.AGlobalAddress), that sum's other term and the high word before the carry, at the constant
+        private static List<(Operand Low, Operand High, int Offset)> BaseCandidates(Operand low, Operand high)
+        {
+            List<(Operand, Operand, int)> list = [(low, high, 0)];
+
+            if (low.AsgOp is Operation add && add.Inst == Instruction.Add && add.SourcesCount == 2 &&
+                high.AsgOp is Operation highAdd && highAdd.Inst == Instruction.Add && highAdd.SourcesCount == 2)
+            {
+                Operand term = add.GetSource(1).Type == OperandType.Constant ? add.GetSource(0) : add.GetSource(0).Type == OperandType.Constant ? add.GetSource(1) : null;
+                Operand constant = term == add.GetSource(0) ? add.GetSource(1) : add.GetSource(0);
+
+                if (term != null && constant.Type == OperandType.Constant)
+                {
+                    for (int index = 0; index < 2; index++)
+                    {
+                        Operand carry = highAdd.GetSource(index);
+
+                        if (carry.AsgOp is Operation select && select.Inst == Instruction.ConditionalSelect &&
+                            select.GetSource(0).AsgOp is Operation compare && compare.SourcesCount == 2 && compare.GetSource(0) == low && compare.GetSource(1) == term)
+                        {
+                            list.Add((term, highAdd.GetSource(1 - index), constant.Value));
+                            break;
+                        }
+                    }
+                }
+            }
+
+            return list;
         }
 
         private static uint PackCbSlotAndOffset(int cbSlot, int cbOffset)
