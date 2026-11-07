@@ -155,7 +155,33 @@ static struct {
     uint32_t cnl[8], dnl; VkExtent2D cext[8], dext;      // each attachment's layers and level size (clears in the pass must cover what they would outside it)
     int swrite;                                          // a draw of the pass wrote memory (storage buffers or images, raw global stores, a geometry shader's claim)
     int bar_pending;                                     // a game barrier came inside the pass and was taken there (vka_rp_game_barrier): the draws after it are checked (bar_hazard)
+    int skip, ord, ndraws;                               // DM_VK_PASS_SKIP names it; its rank among the frame's passes of its size; its draws (DM_VK_PASS_LOG)
 } R;
+// DM_VK_PASS_SKIP=<w>x<h>[#n],… (live, diagnostic: the picture breaks): the draws of the frame's passes of that render area (the n-th of that size only, from 0) are not
+// recorded, to time a pass in the frame (a draw timed alone is no measure of what it costs there). DM_VK_PASS_LOG=<n> (live): the passes of the next n frames logged at their end
+static struct { uint32_t w, h; int ord; } g_psk[16]; static int g_npsk, g_plog; static uint32_t g_psk_gen = ~0u;
+static struct { uint32_t w, h; int n; } g_pord[64]; static int g_npord; static uint64_t g_pord_frame;
+static int pass_rank(uint32_t w, uint32_t h) {   // this pass's rank among the frame's passes of its size so far
+    uint64_t vka_frame(void), f = vka_frame();
+    if (f != g_pord_frame) { g_pord_frame = f; g_npord = 0; if (g_plog > 0) g_plog--; }
+    for (int i = 0; i < g_npord; i++) if (g_pord[i].w == w && g_pord[i].h == h) return g_pord[i].n++;
+    if (g_npord < 64) g_pord[g_npord++] = (typeof(g_pord[0])){w, h, 1};
+    return 0;
+}
+static int pass_skip(uint32_t w, uint32_t h, int ord) {
+    uint32_t g = atomic_load(&vka_env_gen);
+    if (g != g_psk_gen) {
+        g_psk_gen = g; g_npsk = 0;
+        for (const char *e = getenv("DM_VK_PASS_SKIP"); e && *e && g_npsk < 16;) {
+            char *x; unsigned long a = strtoul(e, &x, 10); if (x == e || *x != 'x') break;
+            unsigned long b = strtoul(x + 1, &x, 10); int o = -1; if (*x == '#') o = (int)strtol(x + 1, &x, 10);
+            g_psk[g_npsk++] = (typeof(g_psk[0])){(uint32_t)a, (uint32_t)b, o}; e = *x == ',' ? x + 1 : x;
+        }
+        static int lg = -1; int v = (int)VKA_ENV("DM_VK_PASS_LOG", 0); if (v != lg) { lg = v; g_plog = v > 0 ? v + 1 : 0; }
+    }
+    for (int i = 0; i < g_npsk; i++) if (g_psk[i].w == w && g_psk[i].h == h && (g_psk[i].ord < 0 || g_psk[i].ord == ord)) return 1;
+    return 0;
+}
 // Clears waiting for the pass of their targets (vka_rp_clear), in order: the next draw over the same targets opens its pass with them (loadOp CLEAR, or vkCmdClearAttachments),
 // anything else does them outside a pass first (pc_flush), as before
 enum { NPC = 16 };
@@ -180,6 +206,8 @@ static uint64_t g_bar_in, g_bar_kept, g_bar_late;
 void vka_rp_end(void) {
     if (PC.n) pc_flush();
     if (!R.on) return;
+    if (g_plog > 0) VLOG("pass %ux%ux%u #%d: %d draws%s, colour formats %d %d %d %d, depth %d", R.area.extent.width, R.area.extent.height, R.layers, R.ord, R.ndraws,
+                                                                            R.skip ? " (DM_VK_PASS_SKIP: not recorded)" : "", R.cf[0], R.cf[1], R.cf[2], R.cf[3], R.df);
     vk.vkCmdEndRendering(g_cb);
     vka_barrier(g_cb);   // the pass's writes before whatever reads them next (copies, the present, the next pass's samples)
     R.on = 0; vka_tex_feedback(NULL, NULL, 0);
@@ -249,6 +277,7 @@ static int rp_begin(const p_set_rt *rt, int has_rt, const vka_dstate *d) {
         w = (uint32_t)fabsf(d->vp[0][2]); h = (uint32_t)fabsf(d->vp[0][3]); if (!w) w = 1; if (!h) h = 1; layers = 1;
     }
     R.area = (VkRect2D){{0, 0}, {w, h}}; R.layers = layers; R.samples = samples ? samples : 1;
+    R.ord = pass_rank(w, h); R.skip = pass_skip(w, h, R.ord);
     // The pending clears of these targets (PC): loadOp CLEAR when one covers its attachment and the attachment is the render area, else vkCmdClearAttachments once the pass
     // begins when the rectangle is inside the render area and the attachment has the pass's layers, else outside before it begins
     int nlate = 0; vka_pclear *late[NPC];
@@ -1344,7 +1373,8 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
               vka_tex_id_dump(g_res[i].tid);
           } } }
     if (!rp_begin(rt, has_rt, d)) { g_skipped++; return; }
-    if (draw_skip(sh)) return;   // DM_VK_DRAW_SKIP: the pass stays open (its clears and loads stay), only the draw goes
+    if (draw_skip(sh) || R.skip) return;   // DM_VK_DRAW_SKIP, DM_VK_PASS_SKIP: the pass stays open (its clears and loads stay), only the draw goes
+    R.ndraws++;
     if (vka_gp_active) { int32_t c = dw ? dw->count : di->count; int ni = dw ? dw->instances : di->instances;   // DM_VK_GPUPROF: the step's shader pairs and vertices (0 when the GPU has the count)
         vka_gp_draw(sh[mesh ? 7 : 0]->key, d->rast_discard || !sh[1] ? 0 : sh[1]->key, ind || mesh || c <= 0 ? 0 : (uint64_t)c * (uint64_t)(ni > 1 ? ni : 1)); }
     if (!R.swrite && draw_writes(sh, d)) R.swrite = 1;   // (a game barrier in this pass from now on ends it: vka_rp_game_barrier)
