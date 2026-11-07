@@ -622,6 +622,9 @@ def finish(key, w, job, c1):
                 x.set_binding(r['id'], rec['set'], rec['binding'])
             if variant == VK['MOD_MESH_EMU_VS']: spv.gl_depth(x, VK['SPEC_GL_DEPTH'])
             mods.append((variant, x.data()))
+            if variant == VK['MOD_MESH_EMU']:   # its shuffles through workgroup memory, as a compute module's (Ocarina of Time's moss task program: 32 shuffles a loop pass)
+                xl = spv.Module(x.data())
+                if spv.shuffle_lds(xl, VK['SHARED_MAX']): mods.append((VK['MOD_MESH_EMU_SHUFFLE_LDS'], xl.data()))
     for variant, data in mods:
         err = validate(data, w, f'{key}_{variant}')
         if err: return 'spirv-val failed', err, None

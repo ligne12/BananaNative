@@ -1087,9 +1087,9 @@ static void memu_rb_drain(int all) {
     for (int i = 0; i < 64; i++) {
         if (!g_memu_rb_frame[i] || (!all && g_memu_rb_frame[i] + 8 > vka_frame())) continue;
         const uint32_t *h = g_memu_rb.map + 16 * i;
-        VLOG("mesh emulation readback (frame %llu, task %016llx mesh %016llx): mesh workgroups launched %u, draw vertex count %u, capacity %u, first %u, has task %u",
+        VLOG("mesh emulation readback (frame %llu, task %016llx mesh %016llx): mesh workgroups launched %u, draw vertex count %u, capacity %u, first %u, has task %u, task workgroups %u",
              (unsigned long long)g_memu_rb_frame[i], (unsigned long long)g_memu_rb_keys[i][0], (unsigned long long)g_memu_rb_keys[i][1], h[DMSH_MESH_EMU_DISPATCH],
-             h[DMSH_MESH_EMU_DRAW], h[DMSH_MESH_EMU_CAPACITY], h[DMSH_MESH_EMU_FIRST], h[DMSH_MESH_EMU_HAS_TASK]);
+             h[DMSH_MESH_EMU_DRAW], h[DMSH_MESH_EMU_CAPACITY], h[DMSH_MESH_EMU_FIRST], h[DMSH_MESH_EMU_HAS_TASK], h[DMSH_MESH_EMU_HAS_TASK] ? h[14] : 0);
         g_memu_rb_frame[i] = 0;
     }
 }
@@ -1212,8 +1212,8 @@ static int memu_run(vka_dstate *d, const p_draw *dw, vka_shader *const sh[VKA_NS
              g_memu_logged, sh[6] ? (unsigned long long)sh[6]->key : 0ull, (unsigned long long)sh[7]->key, sh[1] ? (unsigned long long)sh[1]->key : 0ull,
              dw->ind ? "indirect at" : "count", dw->ind ? 0 : dw->count, dw->first,
              (unsigned long long)cap, (unsigned long long)planes, (unsigned long long)maxp, (unsigned long long)pw, dw->ind ? " (arguments read by the GPU)" : "");
-        VkBufferCopy c = {0, 64 * (VkDeviceSize)slot, 64};
-        vk.vkCmdCopyBuffer(g_cb, g_memu.buf, g_memu_rb.buf, 1, &c);
+        VkBufferCopy c[2] = {{0, 64 * (VkDeviceSize)slot, 56}, {4 * (VkDeviceSize)td, 64 * (VkDeviceSize)slot + 56, 4}};   // with a task program, its dispatch's x as word 14 (unused in the header)
+        vk.vkCmdCopyBuffer(g_cb, g_memu.buf, g_memu_rb.buf, sh[6] ? 2 : 1, c);
         VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
         vk.vkCmdPipelineBarrier(g_cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
         vka_barrier(g_cb);

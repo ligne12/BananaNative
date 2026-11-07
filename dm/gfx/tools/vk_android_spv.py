@@ -726,7 +726,7 @@ VN_OPS = {OP_IADD, OP_ISUB, OP_IMUL, OP_SHR_LOGICAL, OP_SHR_ARITH, OP_SHL_LOGICA
 def input_builtin(m, builtin, ty):
     """The Input variable of a builtin (a plain variable), added with its decoration and in the entry point's interface when the module has none → its id"""
     v, member = m.builtin_var(SC_INPUT, builtin)
-    if v is not None and member is None: return v
+    if v is not None and member is None: return v   # (builtin_var looks in the interface: it is listed)
     p = m.add_type(OP_TYPE_POINTER, SC_INPUT, ty); v = m.new_id()
     m._insert_decl([4 << 16 | OP_VARIABLE, p, v, SC_INPUT])
     m.ins.insert(next(k for k, x in enumerate(m.ins) if x[0] & 0xffff == OP_DECORATE), [4 << 16 | OP_DECORATE, v, DEC_BUILTIN, builtin])
@@ -804,6 +804,8 @@ def shuffle_lds(m, shared_max):
     arr = m.add_type(OP_TYPE_ARRAY, u32, m.add_const(u32, 2 * words))
     p_arr = m.add_type(OP_TYPE_POINTER, SC_WORKGROUP, arr); p_u = m.add_type(OP_TYPE_POINTER, SC_WORKGROUP, u32)
     xs = m.new_id(); m._insert_decl([4 << 16 | OP_VARIABLE, p_arr, xs, SC_WORKGROUP])
+    if m.header[1] >= 0x10400:   # SPIR-V 1.4 lists every global variable the entry point uses (a mesh emulation module; the translator writes compute modules in 1.3)
+        k = next(k for k, x in enumerate(m.ins) if x[0] & 0xffff == OP_ENTRY_POINT); m.ins[k] = m.ins[k] + [xs]; m.ins[k][0] = len(m.ins[k]) << 16 | OP_ENTRY_POINT
     row_off = [None, m.add_const(u32, words)]; C = {v: m.add_const(u32, v) for v in (SCOPE_SUBGROUP, SEM_ACQ_REL_WORKGROUP)}
     sgid, sgsz, sgl = (input_builtin(m, b, u32) for b in (BUILTIN_SUBGROUP_ID, BUILTIN_SUBGROUP_SIZE, BUILTIN_SUBGROUP_LOCAL_INVOCATION_ID))
     if CAP_GROUP_NON_UNIFORM not in m.caps:

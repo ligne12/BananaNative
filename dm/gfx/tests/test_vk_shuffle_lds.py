@@ -81,9 +81,9 @@ int main(int argc, char **argv) {
 '''
 
 
-def compile_module(d, src=SHADER):
+def compile_module(d, src=SHADER, env='vulkan1.1'):
     (d / 's.comp').write_text(src)
-    subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.1', str(d / 's.comp'), '-o', str(d / 's.spv')], check=True, capture_output=True)
+    subprocess.run(['glslangValidator', '-V', '--target-env', env, str(d / 's.comp'), '-o', str(d / 's.spv')], check=True, capture_output=True)
     return spv.Module((d / 's.spv').read_bytes())
 
 
@@ -109,6 +109,16 @@ class ShuffleLdsRewrite(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             for b in (spv.BUILTIN_SUBGROUP_ID, spv.BUILTIN_SUBGROUP_SIZE):
                 self.assertIn(m.builtin_var(spv.SC_INPUT, b)[0], m.interface())
+
+    def test_spirv_1_4_interface(self):   # a mesh emulation module is SPIR-V 1.4, whose entry point lists every global variable it uses: the rows too
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d); m = compile_module(d, env='vulkan1.2')
+            self.assertGreaterEqual(m.header[1], 0x10400)
+            self.assertTrue(spv.shuffle_lds(m, 32768))
+            self.assertIn(next(v for v, nm in m.names.items() if nm == 'dm_shuffle_rows'), m.interface())
+            (d / 'r.spv').write_bytes(m.data())
+            r = subprocess.run(['spirv-val', '--target-env', 'vulkan1.3', str(d / 'r.spv')], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
     def test_one_store_for_ldsm(self):
         src = SHADER[:SHADER.index('shared uint other')] + '''void main()

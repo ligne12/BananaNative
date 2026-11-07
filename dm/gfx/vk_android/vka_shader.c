@@ -77,8 +77,11 @@ static void shuffle_plan(void) {
 }
 VkShaderModule vka_shader_cs_module(vka_shader *s) {
     // An emulated task / mesh program (vka_draw.c memu_run): its compute module
-    if ((s->e->stage == DMSH_VK_STAGE_TS || s->e->stage == DMSH_VK_STAGE_MS) && !V.mesh) return vka_shader_module(s, DMSH_VK_MOD_MESH_EMU);
     if (g_shuffle_lds < 0) shuffle_plan();
+    if ((s->e->stage == DMSH_VK_STAGE_TS || s->e->stage == DMSH_VK_STAGE_MS) && !V.mesh) {   // (its shuffles through workgroup memory as a compute shader's, where the library has that module)
+        VkShaderModule m = g_shuffle_lds && vka_shlib_module(s->lib, s->e, DMSH_VK_MOD_MESH_EMU_SHUFFLE_LDS) ? vka_shader_module(s, DMSH_VK_MOD_MESH_EMU_SHUFFLE_LDS) : VK_NULL_HANDLE;
+        return m ? m : vka_shader_module(s, DMSH_VK_MOD_MESH_EMU);
+    }
     VkShaderModule m = g_shuffle_lds && vka_shlib_module(s->lib, s->e, DMSH_VK_MOD_SHUFFLE_LDS) ? vka_shader_module(s, DMSH_VK_MOD_SHUFFLE_LDS) : VK_NULL_HANDLE;
     return m ? m : s->mods[DMSH_VK_MOD_BASE];   // (that module not made: logged by vka_shader_module; the base one)
 }
@@ -246,7 +249,7 @@ static VkShaderModule spv_module(const vka_shlib *L, const dmsh_vk_entry *e, con
     return mod;
 }
 VkShaderModule vka_shader_module(vka_shader *s, int variant) {
-    if (variant < 0 || variant > DMSH_VK_MOD_MESH_EMU_FLAT) return VK_NULL_HANDLE;
+    if (variant < 0 || variant > DMSH_VK_MOD_MESH_EMU_SHUFFLE_LDS) return VK_NULL_HANDLE;
     if (s->mods[variant]) return s->mods[variant];
     const dmsh_vk_module *m = vka_shlib_module(s->lib, s->e, variant);
     if (!m) return VK_NULL_HANDLE;

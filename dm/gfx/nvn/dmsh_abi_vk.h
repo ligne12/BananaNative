@@ -109,6 +109,7 @@
 #define DMSH_VK_MOD_MESH_EMU 5           // task / mesh: the program as compute through its DMSH_VK_KIND_MESH_EMU region, for a device without VK_EXT_mesh_shader
 #define DMSH_VK_MOD_MESH_EMU_VS 6        // mesh: the vertex shader that draws that region's primitives (Ryujinx SpirvMeshEmuVertex.cs), with the GL depth constant
 #define DMSH_VK_MOD_MESH_EMU_FLAT 7      // a pixel shader with per-primitive inputs, without PerPrimitiveEXT: drawn after the emulated mesh's vertex shader (its Flat outputs)
+#define DMSH_VK_MOD_MESH_EMU_SHUFFLE_LDS 8   // task / mesh: the DMSH_VK_MOD_MESH_EMU module with its shuffles through workgroup memory, as DMSH_VK_MOD_SHUFFLE_LDS for compute
                                          // shuffle instruction (Turnip makes each one a loop); its workgroup memory, with the rows this adds, is at most DMSH_VK_SHARED_MAX bytes
 // How a module is stored: the SPIR-V words as they are, or one zstd frame of them (about a fifth of the size; the replay links zstd's decompressor)
 #define DMSH_VK_CODEC_RAW 0
