@@ -404,6 +404,14 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Fix:** (`vka_tex.c` `pm_cached`) the bitmap is allocated on its own in host-visible, coherent and cached memory (the static block when the device has none, with a red line).
 - **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) on the AYN Thor.
 
+### Raw global memory loads waited for each page table lookup in turn on Turnip
+
+- **Symptom:** (Android) a vertex shader that reads data through pointers it loaded from memory is far slower than its instruction count suggests: Ocarina of Time's `b1f06157308e3b22` (light data, 71 page table lookups a vertex) took 8 ms of GPU for one draw of 53,646 vertices on the AYN Thor, with its pixels cut away (`DM_VK_XP_SCISSOR`), and 2,295 of its 7,321 Turnip instructions were NOPs (`DM_VK_PSTATS`).
+- **Cause:** each lookup of the page table ([Global memory at an address loaded from memory](shaders.md#global-memory-at-an-address-loaded-from-memory)) ended in a branch past the access when the page was outside every segment. After the driver inlined the 71 helpers the shader was a block per access, and Turnip schedules within a block: three dependent table loads, the access's own load, then the next lookup, with nothing to overlap them.
+- **Fix:** loads take their address with no branch: a page outside every segment points them at a zero page instead (`GlobalToStorage.EmitPageTableLoadAddress`, `dmsh_abi.h` `DMSH_GMEM_PT_OUTSIDE` / `DMSH_GMEM_PT_ZERO_BYTES`, `vka_draw.c` `pt_init` / `pt_set`).
+- **Check:** the AYN Thor, 2026-11-07, Kokiri Forest at night, the same view at the same game time: `b1f06157308e3b22` 4,861 instructions (805 NOPs), its three draws timed alone 16.5 → 7.8 ms; the frame p50 60.3 → 56.1 ms, 16.6 → 17.9 fps.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) on the AYN Thor with Turnip, found with `DM_VK_GPUPROF_DRAW` (a timestamp after each draw of the profiled frame).
+
 ### GPU times read with a wrong timestamp period
 
 - **Symptom:** (Android) the replay's GPU time is well under the frame time while the GPU is never idle: Ocarina of Time on the AYN Thor read "GPU 20 ms" in 32 ms frames and "GPU 37 ms" in 58 ms frames outdoors, the same ratio of about 0.64 in every scene, and the submissions' timestamps (`DM_VK_SYNCLOG`'s `sync gpu:` lines) showed no gap between them. The CPU times the completion thread's fence waits returned, between two frames' main submissions, were 58.96 and 55.30 ms against 37.51 and 35.20 ms of timestamps: 1.572 and 1.571 times as long.

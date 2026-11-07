@@ -812,7 +812,8 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
         // nxnative: the Android host's page table in the same binding (IGpuAccessor.QueryGmemPageTable; dmsh_abi.h DMSH_GMEM_PT_*): words 0 to 1023 the null level 2 block (zeros),
         // from GmemPtL1Word one level 1 word for each 2 MiB block of the 39-bit address space (the word index of its level 2 array; 0 the null block), then the level 2 arrays:
-        // two words for each 4 KiB page, the delta of the pool holding it with bit 0 set (deltas are even), or 0
+        // two words for each 4 KiB page, the delta of the pool holding it with bit 0 set (deltas are multiples of 4), or a low word with bit 1 set outside every pool. Words 0 and 1
+        // (the null block's first page) hold the host's zero page's device address with bit 1 set, which loads outside every pool read instead (EmitPageTableLoadAddress)
         private const int GmemPtL1Word = 1024;
         private const int GmemPtVaBits = 39;
         private const int GmemPtBlockLog2 = 21;
@@ -891,8 +892,15 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             Operand deltaLow = Local();
             Operand deltaHigh = Local();
             Operand lblSkip = Label();
+            Operand pageTableLow = null;
+            Operand pageTableHigh = null;
 
-            if (gpuAccessor.QueryGmemPageTable())
+            if (gpuAccessor.QueryGmemPageTable() && operation.Inst == Instruction.Load)
+            {
+                // A load takes its address with no branch (EmitPageTableLoadAddress): outside every pool it reads the zero page
+                EmitPageTableLoadAddress(context, mapBinding, isSmall ? context.BitwiseAnd(addrLow, Const(~3)) : addrLow, addrHigh, out pageTableLow, out pageTableHigh);
+            }
+            else if (gpuAccessor.QueryGmemPageTable())
             {
                 // The Android host's page table (dmsh_abi.h DMSH_GMEM_PT_*): a level 1 word for each 2 MiB of the 39-bit address space holds the word index of that block's
                 // level 2 array (0: the null block), whose two words for each 4 KiB page are the pool's delta with bit 0 set, or 0 outside every pool. Three loads an access,
@@ -996,10 +1004,16 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             }
 
             // A small integer is read or written in its 32-bit word
-            Operand wordLow = isSmall ? context.BitwiseAnd(addrLow, Const(~3)) : addrLow;
-            Operand hostLow = context.IAdd(wordLow, deltaLow);
-            Operand carry = context.ConditionalSelect(context.ICompareLessUnsigned(hostLow, wordLow), Const(1), Const(0));
-            Operand hostHigh = context.IAdd(context.IAdd(addrHigh, deltaHigh), carry);
+            Operand hostLow = pageTableLow;
+            Operand hostHigh = pageTableHigh;
+
+            if (hostLow == null)
+            {
+                Operand wordLow = isSmall ? context.BitwiseAnd(addrLow, Const(~3)) : addrLow;
+                hostLow = context.IAdd(wordLow, deltaLow);
+                Operand carry = context.ConditionalSelect(context.ICompareLessUnsigned(hostLow, wordLow), Const(1), Const(0));
+                hostHigh = context.IAdd(context.IAdd(addrHigh, deltaHigh), carry);
+            }
 
             Operand resultValue = null;
 
@@ -1061,17 +1075,20 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                 context.Return();
             }
 
-            context.MarkLabel(lblSkip);
-
             bool returnsValue = operation.Dest != null;
 
-            if (returnsValue)
+            if (pageTableLow == null)
             {
-                context.Return(Const(0));
-            }
-            else
-            {
-                context.Return();
+                context.MarkLabel(lblSkip);
+
+                if (returnsValue)
+                {
+                    context.Return(Const(0));
+                }
+                else
+                {
+                    context.Return();
+                }
             }
 
             Function function = new(
@@ -1106,11 +1123,39 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             context.Copy(deltaLow, context.BitwiseAnd(ptLow, Const(~1)));
         }
 
+        // nxnative: the host address a load of (addrLow, addrHigh) reads, with no branch: the address plus its pool's delta, or, outside every pool (the page's low word has
+        // bit 1 set), the host's zero page (words 0 and 1) plus the address's offset in its page, which reads 0 as the skipped access did. A branch after each lookup split a
+        // shader into a block per access, and Turnip ran each access's three dependent table loads and its own load one after the other: Ocarina of Time's vertex shader
+        // b1f06157308e3b22 (71 lookups, 7,321 instructions) took 10.7 ms of a 49.5 ms frame of GPU on the AYN Thor (DM_VK_DRAW_SKIP)
+        private static void EmitPageTableLoadAddress(EmitterContext context, int mapBinding, Operand addrLow, Operand addrHigh, out Operand hostLow, out Operand hostHigh)
+        {
+            Operand MapWord(Operand entry, int word)
+            {
+                return context.Load(StorageKind.StorageBuffer, mapBinding, Const(0), context.IAdd(entry, Const(word)));
+            }
+
+            Operand inSpace = context.ICompareLessUnsigned(addrHigh, Const(1 << (GmemPtVaBits - 32)));
+            Operand l1 = context.ConditionalSelect(inSpace, context.BitwiseOr(context.ShiftLeft(addrHigh, Const(32 - GmemPtBlockLog2)), context.ShiftRightU32(addrLow, Const(GmemPtBlockLog2))), Const(0));
+            Operand block = MapWord(l1, GmemPtL1Word);
+            Operand page = context.BitwiseAnd(context.ShiftRightU32(addrLow, Const(GmemPtPageLog2)), Const((1 << (GmemPtBlockLog2 - GmemPtPageLog2)) - 1));
+            Operand pageEntry = context.IAdd(block, context.ShiftLeft(page, Const(1)));
+            Operand ptLow = MapWord(pageEntry, 0);
+            Operand ptHigh = MapWord(pageEntry, 1);
+            Operand outside = context.ICompareNotEqual(context.BitwiseAnd(ptLow, Const(2)), Const(0));
+            Operand baseLow = context.BitwiseAnd(context.ConditionalSelect(outside, MapWord(Const(0), 0), ptLow), Const(~3));
+            Operand baseHigh = context.ConditionalSelect(outside, MapWord(Const(0), 1), ptHigh);
+            Operand offsetLow = context.ConditionalSelect(outside, context.BitwiseAnd(addrLow, Const((1 << GmemPtPageLog2) - 1)), addrLow);
+            Operand offsetHigh = context.ConditionalSelect(outside, Const(0), addrHigh);
+
+            hostLow = context.IAdd(baseLow, offsetLow);
+            hostHigh = context.IAdd(context.IAdd(baseHigh, offsetHigh), context.ConditionalSelect(context.ICompareLessUnsigned(hostLow, baseLow), Const(1), Const(0)));
+        }
+
         // nxnative: the words of one vector load share one page table lookup. The Ampere frontend emits LDG.64 / LDG.128 as a 32-bit load a word, at the same base plus
         // 4, 8 and 12 (InstEmitAmpereMem.ALdg); through the raw path each word made its own lookup, two dependent loads before its own. The loads of a block at one base
         // (an address or that address plus a constant, with its carry) within 16 bytes of each other, with no memory write between, become one call: the helper looks
         // the first word's page up and reads every word with that pool's delta. Words that close are in one pool, which is contiguous on both sides. Ocarina of Time's
-        // vertex shader 4671e5e647fc5455 reads 58 LDG.128 of light probe data a vertex: 232 lookups before, 58 after
+        // vertex shader 4671e5e647fc5455 reads 58 LDG.128 of light probe data a vertex: 232 lookups before, 58 after. The helper has no branch (EmitPageTableLoadAddress)
         private static bool TryGroupRawLoads(
             GtsContext gtsContext,
             ResourceManager resourceManager,
@@ -1195,14 +1240,10 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
                 Operand addrLow = Argument(0);
                 Operand addrHigh = Argument(1);
-                Operand deltaLow = Local();
-                Operand deltaHigh = Local();
-                Operand lblSkip = Label();
 
-                EmitPageTableLookup(context, mapBinding, addrLow, addrHigh, deltaLow, deltaHigh, lblSkip);
+                // (no branch: outside every pool the words come from the zero page, 8 KiB, so a page's last word plus 12 bytes is still in it)
+                EmitPageTableLoadAddress(context, mapBinding, addrLow, addrHigh, out Operand hostLow, out Operand hostHigh);
 
-                Operand hostLow = context.IAdd(addrLow, deltaLow);
-                Operand hostHigh = context.IAdd(context.IAdd(addrHigh, deltaHigh), context.ConditionalSelect(context.ICompareLessUnsigned(hostLow, addrLow), Const(1), Const(0)));
                 Operand first = null;
 
                 for (int index = 0; index < best.Count; index++)
@@ -1232,14 +1273,6 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                 }
 
                 context.Return(first);
-                context.MarkLabel(lblSkip);
-
-                for (int index = 1; index < best.Count; index++)
-                {
-                    context.Copy(Argument(1 + index), Const(0));
-                }
-
-                context.Return(Const(0));
 
                 Function function = new(
                     ControlFlowGraph.Create(context.GetOperations()).Blocks,

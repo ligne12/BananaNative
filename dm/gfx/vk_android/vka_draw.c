@@ -506,11 +506,13 @@ static int drv_seg(const vka_dstate *d, int st, int bank, int pool, VkDescriptor
 }
 // Raw global memory's page table (dmsh_abi.h DMSH_GMEM_PT_*; the shader side is GlobalToStorage.TryGenerateRawStorageOp with QueryGmemPageTable): one buffer for the process,
 // whose pages are set or cleared as placed segments come and go (vka_mem_gen), never rebuilt whole: draws in flight keep reading it, and a page changes only when its segment
-// came or went. A level 2 array is taken when its 2 MiB block first gets a segment, and stays. A segment below 2 MiB, past 39 bits or with an odd delta is left out ([RED]:
-// its accesses read 0). It replaces a table of 4,096 segments the shader searched (12 steps): Zelda: Ocarina of Time places 3,671, and the search inlined into each of a
-// vertex shader's 253 accesses made it 50,769 instructions long on Turnip
+// came or went. A level 2 array is taken when its 2 MiB block first gets a segment, and stays. A segment below 2 MiB, past 39 bits or with a delta that is not a multiple of 4 is
+// left out ([RED]: its accesses read 0). It replaces a table of 4,096 segments the shader searched (12 steps): Zelda: Ocarina of Time places 3,671, and the search inlined into
+// each of a vertex shader's 253 accesses made it 50,769 instructions long on Turnip. A page outside every segment has only its low word written (DMSH_GMEM_PT_OUTSIDE), so a
+// shader reading the table while a segment goes never sees half of an entry it could use as an address: loads take words 0-1, the zero page, instead of its high word
 enum { PT_MAXSEG = 65536, PT_MAXBLK = 3840 };   // level 2 arrays for 7.5 GiB of 2 MiB blocks: a 16 MiB buffer
-static struct { VkBuffer buf; VkDeviceMemory mem; uint32_t *w; VkDeviceSize size; uint32_t nblk; int ok, n; uint64_t gen; } g_gpt;
+static struct { VkBuffer buf, zbuf; VkDeviceMemory mem, zmem; uint32_t *w; VkDeviceSize size; uint32_t nblk; int ok, n; uint64_t gen; } g_gpt;
+static void pt_outside(uint32_t *a) { for (int i = 0; i < DMSH_GMEM_PT_BLOCK_WORDS; i += 2) a[i] = DMSH_GMEM_PT_OUTSIDE; }   // a level 2 array with every page outside
 static uint64_t g_gpt_lo[PT_MAXSEG], g_gpt_hi[PT_MAXSEG], g_gpt_bda[PT_MAXSEG];   // the segments the table holds, by address
 static int pt_init(void) {
     if (g_gpt.ok) return g_gpt.ok > 0;
@@ -523,11 +525,26 @@ static int pt_init(void) {
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = t}; void *p = NULL;
     if (t == UINT32_MAX || vk.vkAllocateMemory(V.dev, &ai, NULL, &g_gpt.mem) || vk.vkBindBufferMemory(V.dev, g_gpt.buf, g_gpt.mem, 0) || vk.vkMapMemory(V.dev, g_gpt.mem, 0, VK_WHOLE_SIZE, 0, &p)) {
         VRED("raw global memory: the page table's %llu bytes were not allocated", (unsigned long long)g_gpt.size); return 0; }
-    g_gpt.w = p; memset(p, 0, (size_t)g_gpt.size); vka_mem_grew(g_gpt.size); g_gpt.ok = 1;
+    // The zero page loads outside every segment read (dmsh_abi.h DMSH_GMEM_PT_ZERO_BYTES): device memory filled with zeros once, never written
+    VkBufferCreateInfo zci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = DMSH_GMEM_PT_ZERO_BYTES, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT};
+    VkMemoryAllocateFlagsInfo af = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+    void *zp = NULL; uint64_t zda = 0;
+    if (!V.bda || vk.vkCreateBuffer(V.dev, &zci, NULL, &g_gpt.zbuf)) { VRED("raw global memory: the zero page's buffer was not made"); return 0; }
+    vk.vkGetBufferMemoryRequirements(V.dev, g_gpt.zbuf, &mr);
+    t = vka_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0);
+    ai = (VkMemoryAllocateInfo){VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &af, .allocationSize = mr.size, .memoryTypeIndex = t};
+    if (t == UINT32_MAX || vk.vkAllocateMemory(V.dev, &ai, NULL, &g_gpt.zmem) || vk.vkBindBufferMemory(V.dev, g_gpt.zbuf, g_gpt.zmem, 0) || vk.vkMapMemory(V.dev, g_gpt.zmem, 0, VK_WHOLE_SIZE, 0, &zp)) {
+        VRED("raw global memory: the zero page was not allocated"); return 0; }
+    memset(zp, 0, (size_t)mr.size);
+    VkBufferDeviceAddressInfo zai = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = g_gpt.zbuf}; zda = vk.vkGetBufferDeviceAddress(V.dev, &zai);
+    if (!zda || (zda & 3)) { VRED("raw global memory: the zero page's device address %#llx is not a multiple of 4", (unsigned long long)zda); return 0; }
+    g_gpt.w = p; memset(p, 0, (size_t)g_gpt.size); pt_outside(g_gpt.w);
+    g_gpt.w[0] = (uint32_t)zda | DMSH_GMEM_PT_OUTSIDE; g_gpt.w[1] = (uint32_t)(zda >> 32);
+    vka_mem_grew(g_gpt.size + mr.size); g_gpt.ok = 1;
     return 1;
 }
 static void pt_set(uint64_t lo, uint64_t hi, uint64_t delta, int on) {
-    if (lo < (2u << 20) || hi > (1ull << 39) || (delta & 1)) {
+    if (lo < (2u << 20) || hi > (1ull << 39) || (delta & 3)) {
         static _Atomic int n; if (on && atomic_fetch_add(&n, 1) < 4) VRED("raw global memory: segment %#llx-%#llx (delta %#llx) left out of the page table", (unsigned long long)lo, (unsigned long long)hi, (unsigned long long)delta);
         return;
     }
@@ -536,11 +553,13 @@ static void pt_set(uint64_t lo, uint64_t hi, uint64_t delta, int on) {
         if (!*l1) {
             if (!on) { pg |= 511; continue; }   // a block with no array has nothing to clear
             if (g_gpt.nblk == PT_MAXBLK) { VRED_ONCE("raw global memory: the page table's %d level 2 arrays are all taken: later segments are left out (their accesses read 0)", PT_MAXBLK); return; }
-            *l1 = DMSH_GMEM_PT_L1 + DMSH_GMEM_PT_L1_WORDS + g_gpt.nblk++ * DMSH_GMEM_PT_BLOCK_WORDS;   // (its array is zeros)
+            uint32_t a = DMSH_GMEM_PT_L1 + DMSH_GMEM_PT_L1_WORDS + g_gpt.nblk++ * DMSH_GMEM_PT_BLOCK_WORDS;
+            pt_outside(g_gpt.w + a);   // (before the level 1 word names it)
+            __atomic_store_n(l1, a, __ATOMIC_RELEASE);
         }
         uint32_t *e = g_gpt.w + *l1 + (pg & 511) * 2;
         if (on) { e[1] = (uint32_t)(delta >> 32); __atomic_store_n(&e[0], (uint32_t)delta | 1, __ATOMIC_RELEASE); }   // (the valid bit last)
-        else { __atomic_store_n(&e[0], 0, __ATOMIC_RELEASE); e[1] = 0; }
+        else __atomic_store_n(&e[0], DMSH_GMEM_PT_OUTSIDE, __ATOMIC_RELEASE);   // (the high word stays: a load outside every segment does not read it)
     }
 }
 uint64_t vka_mem_gen(void);
@@ -1509,6 +1528,7 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
         else { if (qslot >= 0) { vka_nan_query_begin(g_cb, qslot); qbegun = 1; } vk.vkCmdDrawIndexed(g_cb, (uint32_t)di->count, inst, 0, di->base_vertex, binst); }
     }
     g_draws++;
+    if (vka_gp_active) vka_gp_drawn(g_cb);
     PT(8);
     if (qbegun) vka_nan_query_end(g_cb, qslot);   // DM_VK_NANSCAN_GPUDUMP (still inside the pass)
     if (probed && vka_nan_gpudump()) {   // DM_VK_NANSCAN_GPUDUMP: the probed draw's colour targets (what it was given) and their content as the GPU holds them after it
@@ -1528,7 +1548,6 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
         return;
     }
     if (vka_nan_on() >= 2 && vka_nan_split(R.cim, R.nci)) vka_rp_end();   // DM_VK_NANSCAN=2: a scan inside the game's pass
-    if (vka_gp_active) vka_gp_drawn(g_cb);
 }
 
 int dm_sdk_ounce(void);

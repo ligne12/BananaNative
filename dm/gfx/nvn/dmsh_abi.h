@@ -75,12 +75,16 @@
 #define DMSH_GMEM_MAP_ENTRIES 4096       // entries of the table (GlobalToStorage.GmemMapLog2 = 12), sorted by start: entry 0 is empty (start 0, end 0) and unused entries start at ~0
 #define DMSH_GMEM_MAP_ENTRY 32           // bytes of an entry: start, end (exclusive) and delta (the pool's Metal GPU address minus its guest address), 64 bits each, then 8 bytes of padding
 // The Android Vulkan libraries (IGpuAccessor.QueryGmemPageTable) find the pool through a page table in the same binding instead (no search; vka_draw.c gmem_map), 32-bit words:
-// [0, DMSH_GMEM_PT_L1) the null level 2 block (zeros); from DMSH_GMEM_PT_L1 one level 1 word for each 2 MiB block of the 39-bit address space, the word index of the block's
-// level 2 array (0: the null block); then the level 2 arrays, two words for each 4 KiB page of the block: the delta of the pool holding it (its device address minus its guest
-// address, even) with bit 0 set, or 0 outside every pool. Nothing may be placed below 2 MiB (an address past 39 bits reads level 1 word 0)
+// [0, DMSH_GMEM_PT_L1) the null level 2 block; from DMSH_GMEM_PT_L1 one level 1 word for each 2 MiB block of the 39-bit address space, the word index of the block's level 2
+// array (0: the null block); then the level 2 arrays, two words for each 4 KiB page of the block: the delta of the pool holding it (its device address minus its guest address,
+// a multiple of 4) with bit 0 set, or, outside every pool, a low word with bit 1 set (DMSH_GMEM_PT_OUTSIDE). Words 0 and 1 (the null block's first page) hold the device
+// address of a zero page of DMSH_GMEM_PT_ZERO_BYTES with bit 1 set: a load outside every pool reads it at the address's offset in its page, with no branch (Ryujinx
+// GlobalToStorage.EmitPageTableLoadAddress), while a store or atomic is skipped (bit 0 clear). Nothing may be placed below 2 MiB (an address past 39 bits reads level 1 word 0)
 #define DMSH_GMEM_PT_L1 1024
 #define DMSH_GMEM_PT_L1_WORDS 262144     // 2^39 / 2 MiB
 #define DMSH_GMEM_PT_BLOCK_WORDS 1024
+#define DMSH_GMEM_PT_OUTSIDE 2           // a page's low word outside every pool
+#define DMSH_GMEM_PT_ZERO_BYTES 8192     // a page plus the 12 bytes past its last word a vector load reads (GlobalToStorage.TryGroupRawLoads)
 // Where such a store or atomic lands is known only when the GPU runs it, so each one also puts its guest page (address >> 12) in a write log, reserved under the same slot at offset 1
 // (Ryujinx GlobalToStorage.GmemLogCbOffset, GmemLogLog2): 32-bit words, word 0 set when a page found no free slot, then a hash set of 1 << DMSH_GMEM_LOG_LOG2 pages (0 = empty).
 // The host learns the pages from it
