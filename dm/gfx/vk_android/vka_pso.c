@@ -13,7 +13,10 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
+#include <dirent.h>
 #include <errno.h>
+#include "../nvn/dmsh_chain_vk.h"
 
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 // Suspend (mtl_drain, the app going to the background): the prewarm and optimizer threads stop between pipelines until the game submits again (vka_pso_pause(0) at the next
@@ -135,7 +138,7 @@ static int layout_slow(vka_shader *const sh[VKA_NSTAGE], int compute, vka_layout
 
 
 // ---------- The pipeline cache ----------
-// DM_VK_PCACHE (restart): unset = $DM_TEMP/vk_pipelines[-<driver>].bin; a path = that file; 0 = no file (the run starts empty and keeps nothing: a cold run). Before 2026-11-03 "0"
+// DM_VK_PCACHE (restart): unset = $DM_TEMP/vk_pipelines[-<driver>]-<DMSH_VK_CHAIN>.bin (pc_drop_stale); a path = that file; 0 = no file (the run starts empty and keeps nothing: a cold run). Before 2026-11-03 "0"
 // was taken as a file named 0 in the working folder, so a second "cold" run read the first one's pipelines back (stutter-agent cold2gpl: 10 MB read, warm)
 static VkPipelineCache g_pc; static char g_pc_path[1024], g_pw_path[1100]; static uint64_t g_made, g_saved_at, g_save_ns; static double g_create_ms;
 static uint64_t g_ngfx, g_ncs, g_nfail, g_ncs_over, g_create_ns, g_frame_made;   // all pipelines made (frame path, background and prewarm); g_frame_made / g_create_ns: on the frame path only
@@ -145,13 +148,31 @@ static void pw_load(void); static void pw_start(void); static int pw_save(void);
 static void *saver_main(void *a);
 static pthread_mutex_t g_save_mu = PTHREAD_MUTEX_INITIALIZER;   // one save at a time (the saver thread, a forced save)
 static pthread_mutex_t g_sv_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_sv_cv = PTHREAD_COND_INITIALIZER; static int g_sv_want, g_sv_up;
+// The files of this driver's cache for other shader libraries (<base>-<12 hex>.bin) and the one from before the library named them (<base>.bin): removed. The driver keeps a
+// whole cache in memory, and on the AYN Thor one file had grown to 222 MB with the pipelines of 13 libraries, read back at every start (its save copied it all, a quarter more)
+static void pc_drop_stale(const char *dir, const char *base) {
+    DIR *d = opendir(dir); if (!d) return;
+    size_t bl = strlen(base); struct dirent *de;
+    while ((de = readdir(d))) {
+        const char *n = de->d_name, *r = n + bl;
+        if (strncmp(n, base, bl)) continue;
+        int other = r[0] == '-' && strlen(r) == 17 && strspn(r + 1, "0123456789abcdef") == 12 && !strcmp(r + 13, ".bin") && strncmp(r + 1, DMSH_VK_CHAIN, 12);
+        if (strcmp(r, ".bin") && !other) continue;
+        char p[1300]; struct stat st; snprintf(p, sizeof p, "%s/%s", dir, n);
+        long long sz = stat(p, &st) ? -1 : (long long)st.st_size;
+        if (!unlink(p)) VLOG("pipeline cache: %s removed (%lld bytes, another shader library's pipelines)", p, sz);
+    }
+    closedir(d);
+}
 static void pc_open_once(void) {
     const char *e = getenv("DM_VK_PCACHE"), *t = getenv("DM_TEMP"), *home = getenv("HOME");
     if (e && !strcmp(e, "0")) g_pc_path[0] = 0;
     else if (e && *e) snprintf(g_pc_path, sizeof g_pc_path, "%s", e);
-    else if ((t && *t) || (home && *home)) {   // a custom driver (DM_VK_DRIVER) keeps its own file, so switching drivers leaves the system driver's cache alone
-        const char *dt = vka_driver_tag();
-        snprintf(g_pc_path, sizeof g_pc_path, "%s/vk_pipelines%s%s.bin", t && *t ? t : home, dt ? "-" : "", dt ? dt : "");
+    else if ((t && *t) || (home && *home)) {   // a custom driver (DM_VK_DRIVER) keeps its own file, so switching drivers leaves the system driver's cache alone; one file a shader library
+        const char *dt = vka_driver_tag(), *dir = t && *t ? t : home;
+        char base[512]; snprintf(base, sizeof base, "vk_pipelines%s%s", dt ? "-" : "", dt ? dt : "");
+        snprintf(g_pc_path, sizeof g_pc_path, "%s/%s-%s.bin", dir, base, DMSH_VK_CHAIN);
+        pc_drop_stale(dir, base);
     }
     // The prewarm list (pw_*): the pipeline keys of earlier runs, whatever the driver (a key names shaders and state, not driver code). DM_VK_PREWARM_FILE overrides
     const char *pf = getenv("DM_VK_PREWARM_FILE");
