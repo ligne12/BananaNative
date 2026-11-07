@@ -1528,6 +1528,7 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
         return;
     }
     if (vka_nan_on() >= 2 && vka_nan_split(R.cim, R.nci)) vka_rp_end();   // DM_VK_NANSCAN=2: a scan inside the game's pass
+    if (vka_gp_active) vka_gp_drawn(g_cb);
 }
 
 int dm_sdk_ounce(void);

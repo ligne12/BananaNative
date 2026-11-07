@@ -296,6 +296,7 @@ void vka_gp_sub_begin(VkCommandBuffer cb, uint64_t frame);
 void vka_gp_commit(VkCommandBuffer cb, uint64_t fence);
 void vka_gp_sub_frame(uint64_t f);
 void vka_gp_draw(uint64_t vs, uint64_t fs, uint64_t verts);   // a draw recorded in the profiled frame: its vertex (or mesh) and pixel shader keys, its vertices
+void vka_gp_drawn(VkCommandBuffer cb);   // after a draw is recorded in the profiled frame: its timestamp (DM_VK_GPUPROF_DRAW)
 void vka_img_barrier(VkCommandBuffer cb, VkImage img, VkImageAspectFlags aspect, VkImageLayout from, VkImageLayout to);
 // The control line "screenshot" (vka_ctl.c): the present copies the window texture's crop into its command buffer, then hands the texels to the PNG writer once that submission is done
 void vka_ctl_shot_record(VkCommandBuffer cb, vka_img *im, int cx, int cy, int cw, int ch);

@@ -21,6 +21,11 @@ static char g_pass[DESC]; static int g_pass_new;   // the last pass opened (vka_
 static uint64_t g_sub_frame; static int g_sub_frame_set;
 int vka_gp_active;                      // marks are taken (read by vka_barrier)
 static gp_key g_k[NK]; static int g_nk, g_more;   // the shader pairs drawn since the last mark (more: draws of pairs past the first NK)
+// DM_VK_GPUPROF_DRAW=1 (live): a timestamp after every draw of the profiled frame too. Turnip waits for idle before a timestamp after the top of the pipe, so each draw then
+// runs alone: its time is what it costs by itself (ramp-up and drain included), and the frame's step times grow by the overlap the draws had
+enum { ND = 4096 };
+typedef struct { uint64_t vs, fs, verts; int mark; } gp_draw;   // a timed draw: its shader pair, its vertices (0: the GPU has the count), the last mark before it
+static gp_draw g_d[ND], g_cur; static int g_nd, g_draw_on; static VkQueryPool g_dqp;
 
 void vka_gp_sub_frame(uint64_t f) { g_sub_frame = f; g_sub_frame_set = 1; }   // the replay worker: the game frame of the submission it replays next
 static int init(void) {
@@ -31,6 +36,7 @@ static int init(void) {
     PFN_vkCreateQueryPool create = (PFN_vkCreateQueryPool)vk.vkGetDeviceProcAddr(V.dev, "vkCreateQueryPool");
     VkQueryPoolCreateInfo ci = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = NQ};
     if (!g_write || !g_reset || !g_get || !create || create(V.dev, &ci, NULL, &g_qp) || V.props.limits.timestampPeriod <= 0) { VRED("gpu prof: no timestamp query pool"); return 0; }
+    ci.queryCount = ND; if (create(V.dev, &ci, NULL, &g_dqp)) g_dqp = VK_NULL_HANDLE;
     g_ok = 1;
     return 1;
 }
@@ -51,6 +57,14 @@ void vka_gp_draw(uint64_t vs, uint64_t fs, uint64_t verts) {
     int i = 0; while (i < g_nk && !(g_k[i].vs == vs && g_k[i].fs == fs)) i++;
     if (i == g_nk) { if (g_nk == NK) { g_more++; return; } g_k[g_nk++] = (gp_key){vs, fs, 0, 0}; }
     g_k[i].draws++; g_k[i].verts += verts;
+    g_cur = (gp_draw){vs, fs, verts, 0};
+}
+void vka_gp_drawn(VkCommandBuffer cb) {
+    if (!g_draw_on || cb != g_cb || g_nd >= ND || !g_n) return;
+    g_d[g_nd] = g_cur; g_d[g_nd].mark = g_n - 1;
+    vka_enc_sync();
+    g_write(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_dqp, (uint32_t)g_nd);
+    g_nd++;
 }
 void vka_gp_part(VkCommandBuffer cb) { if (!vka_gp_active) return; g_cb = cb; mark(cb, 2, "part", 0); }
 
@@ -93,6 +107,28 @@ static void report(void) {
     char line[1200]; size_t ln = 0; line[0] = 0;
     for (int j = 0; j < nsite && ln < sizeof line; j++) ln += (size_t)snprintf(line + ln, sizeof line - ln, " %s:%d %dx %.2fms;", site[j].f, site[j].l, site[j].n, site[j].ms);
     VLOG("gpu prof: by site:%s", line);
+    if (!g_nd) return;
+    // DM_VK_GPUPROF_DRAW: each draw's time since the timestamp before it (the draw before it in the same step, or the step's mark), the costliest draws and shader pairs
+    static uint64_t td[ND]; static step sd[ND];
+    if (g_get(V.dev, g_dqp, 0, (uint32_t)g_nd, sizeof td, td, 8, VK_QUERY_RESULT_64_BIT)) { VLOG("gpu prof: draw times not ready"); return; }
+    double dtot = 0;
+    for (int i = 0; i < g_nd; i++) {
+        uint64_t t0 = i && g_d[i - 1].mark == g_d[i].mark ? td[i - 1] : t[g_d[i].mark];
+        sd[i] = (step){i, td[i] > t0 ? (td[i] - t0) * vka_gpu_tick_ns() / 1e6 : 0}; dtot += sd[i].ms;
+    }
+    struct { uint64_t vs, fs, verts; int n; double ms, max; } pr[256]; int npr = 0;
+    for (int i = 0; i < g_nd; i++) { const gp_draw *d = &g_d[i]; int j = 0;
+        while (j < npr && !(pr[j].vs == d->vs && pr[j].fs == d->fs)) j++;
+        if (j == npr) { if (npr == 256) continue; pr[npr++] = (typeof(pr[0])){d->vs, d->fs, 0, 0, 0, 0}; }
+        pr[j].n++; pr[j].verts += d->verts; pr[j].ms += sd[i].ms; if (sd[i].ms > pr[j].max) pr[j].max = sd[i].ms; }
+    VLOG("gpu prof: %d draws timed one by one, %.2f ms in all (each drawn alone)", g_nd, dtot);
+    qsort(sd, (size_t)g_nd, sizeof *sd, by_ms);
+    for (int k = 0; k < g_nd && k < 20; k++) { const gp_draw *d = &g_d[sd[k].i];
+        VLOG("gpu prof:  draw %d %.3f ms: %016llx/%016llx %llu v, after mark #%d", sd[k].i, sd[k].ms, (unsigned long long)d->vs, (unsigned long long)d->fs, (unsigned long long)d->verts, d->mark); }
+    for (int a = 0; a < npr; a++) for (int b = a + 1; b < npr; b++) if (pr[b].ms > pr[a].ms) { typeof(pr[0]) x = pr[a]; pr[a] = pr[b]; pr[b] = x; }
+    for (int j = 0; j < npr && j < 20; j++)
+        VLOG("gpu prof:  pair %016llx/%016llx: %d draws %.3f ms (%.1f us each, longest %.3f ms), %llu v", (unsigned long long)pr[j].vs, (unsigned long long)pr[j].fs, pr[j].n, pr[j].ms,
+             1000.0 * pr[j].ms / pr[j].n, pr[j].max, (unsigned long long)pr[j].verts);
 }
 // mtl_sub_begin, after the command buffer begins: arms the profile at a new frame, reports a finished one
 void vka_gp_sub_begin(VkCommandBuffer cb, uint64_t frame) {
@@ -105,6 +141,7 @@ void vka_gp_sub_begin(VkCommandBuffer cb, uint64_t frame) {
         if (every <= 0 || frame == g_frame || (g_last_frame && frame < g_last_frame + (uint64_t)every) || !init()) return;
         g_state = 1; g_frame = g_last_frame = frame; g_n = 0; vka_gp_active = 1; g_pass_new = 0; g_nk = g_more = 0;
         g_reset(cb, g_qp, 0, NQ);
+        g_nd = 0; g_draw_on = g_dqp && VKA_ENV("DM_VK_GPUPROF_DRAW", 0); if (g_draw_on) g_reset(cb, g_dqp, 0, ND);
     }
     if (g_state == 1) { g_cb = cb; mark(cb, 1, "submission", 0); }
 }
