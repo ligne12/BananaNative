@@ -969,7 +969,28 @@ void vka_pso_async_line(char *out, size_t n) {
 }
 // DM_VK_PSTATS=<key>,… (Android, restart; at most 8 keys; the device needs VK_KHR_pipeline_executable_properties): the first pipeline made with one of those shaders is made
 // once more, whole, with no pipeline cache and with the driver's statistics captured; each stage's statistics are logged (Turnip: instructions, registers, waves, spills), then
-// that copy goes. What a translated shader costs once the driver compiled it, to weigh changes of the translator's output (a stall of one compile per key)
+// that copy goes. What a translated shader costs once the driver compiled it, to weigh changes of the translator's output (a stall of one compile per key).
+// DM_VK_PSTATS_IR=<dir> (restart): the copy also captures the driver's internal representations (Turnip: the final NIR and the ir3 assembly), each written to
+// <dir>/<key>-<stage>-<name>.txt: what the driver made of the shader's loads, registers and waits
+static void pstats_ir(VkPipeline p, uint32_t e, const char *stage, uint64_t key) {
+    const char *dir = getenv("DM_VK_PSTATS_IR");
+    PFN_vkGetPipelineExecutableInternalRepresentationsKHR gr = (PFN_vkGetPipelineExecutableInternalRepresentationsKHR)vk.vkGetDeviceProcAddr(V.dev, "vkGetPipelineExecutableInternalRepresentationsKHR");
+    if (!dir || !*dir || !gr) return;
+    VkPipelineExecutableInfoKHR ei = {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR, .pipeline = p, .executableIndex = e};
+    VkPipelineExecutableInternalRepresentationKHR ir[8]; uint32_t n = 8;
+    for (uint32_t i = 0; i < n; i++) ir[i] = (VkPipelineExecutableInternalRepresentationKHR){VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INTERNAL_REPRESENTATION_KHR};
+    if (gr(V.dev, &ei, &n, ir) < 0) return;   // (the sizes)
+    for (uint32_t i = 0; i < n; i++) ir[i].pData = ir[i].dataSize ? malloc(ir[i].dataSize) : NULL;
+    if (gr(V.dev, &ei, &n, ir) >= 0)
+        for (uint32_t i = 0; i < n; i++) {
+            if (!ir[i].pData) continue;
+            char path[512]; int o = snprintf(path, sizeof path, "%s/%016llx-%s-%s.txt", dir, (unsigned long long)key, stage, ir[i].name);
+            for (int c = (int)strlen(dir) + 1; c < o && c < (int)sizeof path; c++) if (path[c] == ' ' || path[c] == '/') path[c] = '_';
+            FILE *f = fopen(path, "wb");
+            if (f) { fwrite(ir[i].pData, 1, ir[i].isText ? strnlen(ir[i].pData, ir[i].dataSize) : ir[i].dataSize, f); fclose(f); VLOG("pipeline statistics of %016llx: %s written", (unsigned long long)key, path); }
+        }
+    for (uint32_t i = 0; i < n; i++) free(ir[i].pData);
+}
 static void pstats(vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, const vka_gkey *k) {
     static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; static uint64_t key[8]; static int nk = -1, done[8];
     pthread_mutex_lock(&mu);
@@ -981,7 +1002,11 @@ static void pstats(vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, cons
     PFN_vkGetPipelineExecutablePropertiesKHR gp = (PFN_vkGetPipelineExecutablePropertiesKHR)vk.vkGetDeviceProcAddr(V.dev, "vkGetPipelineExecutablePropertiesKHR");
     PFN_vkGetPipelineExecutableStatisticsKHR gs = (PFN_vkGetPipelineExecutableStatisticsKHR)vk.vkGetDeviceProcAddr(V.dev, "vkGetPipelineExecutableStatisticsKHR");
     pstate *P = malloc(sizeof *P); VkPipeline p = VK_NULL_HANDLE; VkResult r = VK_ERROR_UNKNOWN;
-    if (gp && gs && P && pstate_fill(P, sh, lay, k)) { P->ci.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR; r = vk.vkCreateGraphicsPipelines(V.dev, VK_NULL_HANDLE, 1, &P->ci, NULL, &p); }
+    const char *irdir = getenv("DM_VK_PSTATS_IR");
+    if (gp && gs && P && pstate_fill(P, sh, lay, k)) {
+        P->ci.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR | (irdir && *irdir ? VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR : 0);
+        r = vk.vkCreateGraphicsPipelines(V.dev, VK_NULL_HANDLE, 1, &P->ci, NULL, &p);
+    }
     free(P);
     if (r || !p) { VRED("pipeline statistics of %016llx: the copy of its pipeline was not made (%d)", (unsigned long long)key[hit], r); return; }
     VkPipelineInfoKHR pi = {VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR, .pipeline = p};
@@ -1002,6 +1027,7 @@ static void pstats(vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, cons
                                        st[i].format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR ? (long long)v->i64 : (long long)v->u64);
         }
         VLOG("pipeline statistics of %016llx: %s:%s", (unsigned long long)key[hit], ep[e].name, line);
+        pstats_ir(p, e, ep[e].name, key[hit]);
     }
     vk.vkDestroyPipeline(V.dev, p, NULL);
 }
