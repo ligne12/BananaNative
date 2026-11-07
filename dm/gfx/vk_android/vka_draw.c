@@ -538,10 +538,11 @@ static int drv_seg(const vka_dstate *d, int st, int bank, int pool, VkDescriptor
 // came or went. A level 2 array is taken when its 2 MiB block first gets a segment, and stays. A segment below 2 MiB, past 39 bits or with a delta that is not a multiple of 4 is
 // left out ([RED]: its accesses read 0). It replaces a table of 4,096 segments the shader searched (12 steps): Zelda: Ocarina of Time places 3,671, and the search inlined into
 // each of a vertex shader's 253 accesses made it 50,769 instructions long on Turnip. A page outside every segment has only its low word written (DMSH_GMEM_PT_OUTSIDE), so a
-// shader reading the table while a segment goes never sees half of an entry it could use as an address: loads take words 0-1, the zero page, instead of its high word
-enum { PT_MAXSEG = 65536, PT_MAXBLK = 3840 };   // level 2 arrays for 7.5 GiB of 2 MiB blocks: a 16 MiB buffer
+// shader reading the table while a segment goes never sees half of an entry it could use as an address: loads take words 0-1, the zero page, instead of its high word.
+// Each page of a segment also names the segment's pages (DMSH_GMEM_PT_BOUNDS), for the accesses a shader takes through one pointer's lookup
+enum { PT_MAXSEG = 65536, PT_MAXBLK = 3840 };   // level 2 arrays for 7.5 GiB of 2 MiB blocks: a 31 MiB buffer
 static struct { VkBuffer buf, zbuf; VkDeviceMemory mem, zmem; uint32_t *w; VkDeviceSize size; uint32_t nblk; int ok, n; uint64_t gen; } g_gpt;
-static void pt_outside(uint32_t *a) { for (int i = 0; i < DMSH_GMEM_PT_BLOCK_WORDS; i += 2) a[i] = DMSH_GMEM_PT_OUTSIDE; }   // a level 2 array with every page outside
+static void pt_outside(uint32_t *a) { for (int i = 0; i < DMSH_GMEM_PT_PAGE_WORDS; i += 2) a[i] = DMSH_GMEM_PT_OUTSIDE; }   // a level 2 array with every page outside
 static uint64_t g_gpt_lo[PT_MAXSEG], g_gpt_hi[PT_MAXSEG], g_gpt_bda[PT_MAXSEG];   // the segments the table holds, by address
 static int pt_init(void) {
     if (g_gpt.ok) return g_gpt.ok > 0;
@@ -586,8 +587,8 @@ static void pt_set(uint64_t lo, uint64_t hi, uint64_t delta, int on) {
             pt_outside(g_gpt.w + a);   // (before the level 1 word names it)
             __atomic_store_n(l1, a, __ATOMIC_RELEASE);
         }
-        uint32_t *e = g_gpt.w + *l1 + (pg & 511) * 2;
-        if (on) { e[1] = (uint32_t)(delta >> 32); __atomic_store_n(&e[0], (uint32_t)delta | 1, __ATOMIC_RELEASE); }   // (the valid bit last)
+        uint32_t *e = g_gpt.w + *l1 + (pg & 511) * 2, *b = e + DMSH_GMEM_PT_BOUNDS;
+        if (on) { b[0] = (uint32_t)(lo >> 12); b[1] = (uint32_t)((hi + 0xfff) >> 12); e[1] = (uint32_t)(delta >> 32); __atomic_store_n(&e[0], (uint32_t)delta | 1, __ATOMIC_RELEASE); }   // (the valid bit last)
         else __atomic_store_n(&e[0], DMSH_GMEM_PT_OUTSIDE, __ATOMIC_RELEASE);   // (the high word stays: a load outside every segment does not read it)
     }
 }

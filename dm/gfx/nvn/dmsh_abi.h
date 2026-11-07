@@ -79,10 +79,15 @@
 // array (0: the null block); then the level 2 arrays, two words for each 4 KiB page of the block: the delta of the pool holding it (its device address minus its guest address,
 // a multiple of 4) with bit 0 set, or, outside every pool, a low word with bit 1 set (DMSH_GMEM_PT_OUTSIDE). Words 0 and 1 (the null block's first page) hold the device
 // address of a zero page of DMSH_GMEM_PT_ZERO_BYTES with bit 1 set: a load outside every pool reads it at the address's offset in its page, with no branch (Ryujinx
-// GlobalToStorage.EmitPageTableLoadAddress), while a store or atomic is skipped (bit 0 clear). Nothing may be placed below 2 MiB (an address past 39 bits reads level 1 word 0)
+// GlobalToStorage.EmitPageTableLoadAddress), while a store or atomic is skipped (bit 0 clear). Nothing may be placed below 2 MiB (an address past 39 bits reads level 1 word 0).
+// A level 2 array is DMSH_GMEM_PT_BLOCK_WORDS: its pages' entries (DMSH_GMEM_PT_PAGE_WORDS), then from DMSH_GMEM_PT_BOUNDS two words for each page of a pool, the first and
+// the end (exclusive) page (address >> 12) of the segment holding it: a shader that reads many words through one pointer looks the pointer up once and takes each word in
+// that segment with its delta (GlobalToStorage.TrySharedBaseRawLoad). The null block has no bounds (its pages are outside every pool)
 #define DMSH_GMEM_PT_L1 1024
 #define DMSH_GMEM_PT_L1_WORDS 262144     // 2^39 / 2 MiB
-#define DMSH_GMEM_PT_BLOCK_WORDS 1024
+#define DMSH_GMEM_PT_PAGE_WORDS 1024     // the entries of a level 2 array, and the null block
+#define DMSH_GMEM_PT_BOUNDS 1024
+#define DMSH_GMEM_PT_BLOCK_WORDS 2048
 #define DMSH_GMEM_PT_OUTSIDE 2           // a page's low word outside every pool
 #define DMSH_GMEM_PT_ZERO_BYTES 8192     // a page plus the 12 bytes past its last word a vector load reads (GlobalToStorage.TryGroupRawLoads)
 // Where such a store or atomic lands is known only when the GPU runs it, so each one also puts its guest page (address >> 12) in a write log, reserved under the same slot at offset 1

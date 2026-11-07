@@ -198,18 +198,21 @@ static void gpu_tag_begin(uint64_t f) {
 }
 // The tick's length measured instead of taken from timestampPeriod, which can be wrong: Mr. Purple's Turnip T30 on the AYN Thor says 33.11 ns where its counter ticks at
 // 19.2 MHz (52.08 ns), so every GPU time read 1.57 times short (Ocarina of Time: "GPU 20 ms" in 32 ms frames with the GPU never idle). A submission's last timestamp is
-// paired with the CPU time the completion thread's blocked wait for its fence returned (vka_fence_wake_ns); two pairs at least 4 s apart give the length, once
+// paired with the CPU time the completion thread's blocked wait for its fence returned (vka_fence_wake_ns); two pairs at least 4 s apart give the length. The counter
+// stops while the GPU sleeps, so a window over idle time reads the tick long (Ocarina of Time's loading once measured 99.27 ns, and every GPU time read 1.9 times long):
+// the windows go on, each starting where the last ended, and the shortest tick measured is kept
 uint64_t vka_fence_wake_ns(uint64_t f);   // vka_dev.c
 static void ts_calibrate(uint64_t fence, uint64_t tick) {
-    static uint64_t c0, k0; static int done;
-    uint64_t c = done ? 0 : vka_fence_wake_ns(fence);
+    static uint64_t c0, k0; static double best;
+    uint64_t c = vka_fence_wake_ns(fence);
     if (!c || !tick) return;
     if (!c0 || tick <= k0 || c <= c0) { c0 = c; k0 = tick; return; }
     if (c - c0 < 4000000000ull) return;
     double p = (double)(c - c0) / (double)(tick - k0), d = V.props.limits.timestampPeriod;
-    done = 1;
-    if (p < d / 4 || p > d * 4) { VRED("GPU time: a tick measured at %.2f ns, the driver says %.2f: the driver's kept", p, d); return; }
-    g_ts_ns = p; if (g_sq_ns) g_sq_ns = p;
+    c0 = c; k0 = tick;
+    if (p < d / 4 || p > d * 4) { static int n; if (!n++) VRED("GPU time: a tick measured at %.2f ns, the driver says %.2f: the driver's kept", p, d); return; }
+    if (best && p > best * 0.995) return;   // (no shorter by half a percent: not logged again)
+    best = p; g_ts_ns = p; if (g_sq_ns) g_sq_ns = p;
     VLOG("GPU time: a tick measured at %.2f ns against the CPU clock (the driver says %.2f ns: GPU times were %.2f times %s before)", p, d, p > d ? p / d : d / p, p > d ? "short" : "long");
 }
 double vka_gpu_tick_ns(void) { return g_ts_ok > 0 ? g_ts_ns : V.props.limits.timestampPeriod; }   // (vka_gprof.c)

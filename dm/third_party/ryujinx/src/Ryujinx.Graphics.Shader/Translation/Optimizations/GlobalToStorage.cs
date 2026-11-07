@@ -85,6 +85,12 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             // nxnative: the helpers of grouped raw loads (TryGroupRawLoads), by their words' byte offsets from the first
             public readonly Dictionary<string, int> RawGroups = new();
 
+            // nxnative: the pointers whose page table lookup the raw loads through them share (TrySharedBaseLookup): delta low and high, first and end page of the
+            // pointer's segment, or null for a pointer whose lookup could not be placed; the lookup helper; the shader's blocks, to find where a pointer is read
+            public readonly Dictionary<(Operand, Operand), Operand[]> SharedBases = new();
+            public int BaseLookupId = -1;
+            public BasicBlock[] Blocks;
+
             public int AddRawGroup(string key, Function function)
             {
                 int functionId = _hfm.AddFunction(function);
@@ -231,7 +237,7 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             IGpuAccessor gpuAccessor,
             TargetLanguage targetLanguage)
         {
-            GtsContext gtsContext = new(hfm);
+            GtsContext gtsContext = new(hfm) { Blocks = blocks };
 
             foreach (BasicBlock block in blocks)
             {
@@ -818,6 +824,7 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
         private const int GmemPtVaBits = 39;
         private const int GmemPtBlockLog2 = 21;
         private const int GmemPtPageLog2 = 12;
+        private const int GmemPtBoundsWord = 1024;   // (dmsh_abi.h DMSH_GMEM_PT_BOUNDS) a page's segment bounds, first and end page, this far past its entry
 
         // nxnative: the write log (dmsh_abi.h DMSH_GMEM_LOG_*), reserved under the same sentinel slot at offset 1: the set of guest pages (address >> 12) the stores and atomics wrote,
         // as an open-addressing hash set of 1 << GmemLogLog2 words from word 1 (0 = empty), word 0 set when a page found no free slot in GmemLogProbes tries. The host cannot know where
@@ -1227,12 +1234,26 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                 }
             }
 
-            if (best == null || !resourceManager.TryGetStorageBufferBinding(GmemMapCbSlot, 0, write: false, out int mapBinding))
+            if (!resourceManager.TryGetStorageBufferBinding(GmemMapCbSlot, 0, write: false, out int mapBinding))
             {
                 return false;
             }
 
-            string key = string.Join(",", best.ConvertAll(member => member.Delta));
+            // A load through a pointer read from memory takes that pointer's lookup (TrySharedBaseLookup), alone or with the words beside it
+            Operand[] shared = TrySharedBaseLookup(gtsContext, mapBinding, operation.GetSource(0), operation.GetSource(1));
+
+            if (best == null && shared != null)
+            {
+                best = [(operation, node, 0)];
+            }
+
+            if (best == null)
+            {
+                return false;
+            }
+
+            int inArgs = shared != null ? 6 : 2;
+            string key = (shared != null ? "s" : "") + string.Join(",", best.ConvertAll(member => member.Delta));
 
             if (!gtsContext.RawGroups.TryGetValue(key, out int groupId))
             {
@@ -1240,9 +1261,18 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
                 Operand addrLow = Argument(0);
                 Operand addrHigh = Argument(1);
+                Operand hostLow;
+                Operand hostHigh;
 
                 // (no branch: outside every pool the words come from the zero page, 8 KiB, so a page's last word plus 12 bytes is still in it)
-                EmitPageTableLoadAddress(context, mapBinding, addrLow, addrHigh, out Operand hostLow, out Operand hostHigh);
+                if (shared != null)
+                {
+                    EmitSharedLoadAddress(context, mapBinding, addrLow, addrHigh, Argument(2), Argument(3), Argument(4), Argument(5), out hostLow, out hostHigh);
+                }
+                else
+                {
+                    EmitPageTableLoadAddress(context, mapBinding, addrLow, addrHigh, out hostLow, out hostHigh);
+                }
 
                 Operand first = null;
 
@@ -1268,7 +1298,7 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                     }
                     else
                     {
-                        context.Copy(Argument(1 + index), value);
+                        context.Copy(Argument(inArgs - 1 + index), value);
                     }
                 }
 
@@ -1276,9 +1306,9 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
                 Function function = new(
                     ControlFlowGraph.Create(context.GetOperations()).Blocks,
-                    "LoadGlobalRawGroup_" + key.Replace(",", "_").Replace("-", "m"),
+                    (shared != null ? "LoadGlobalRawShared_" : "LoadGlobalRawGroup_") + key.TrimStart('s').Replace(",", "_").Replace("-", "m"),
                     true,
-                    2,
+                    inArgs,
                     best.Count - 1);
 
                 groupId = gtsContext.AddRawGroup(key, function);
@@ -1291,7 +1321,11 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                 dests[index] = Local();
             }
 
-            Operation callOp = new(Instruction.Call, 0, dests, [Const(groupId), operation.GetSource(0), operation.GetSource(1)]);
+            Operand[] sources = shared != null
+                ? [Const(groupId), operation.GetSource(0), operation.GetSource(1), shared[0], shared[1], shared[2], shared[3]]
+                : [Const(groupId), operation.GetSource(0), operation.GetSource(1)];
+
+            Operation callOp = new(Instruction.Call, 0, dests, sources);
 
             node.List.AddBefore(node, callOp);
 
@@ -1341,6 +1375,219 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             }
 
             return list;
+        }
+
+        // nxnative: one page table lookup for every raw load through the same pointer. A shader that reads an array through a pointer it loaded from memory (Ocarina of Time's
+        // skinning: a vertex's bone matrices, the bone index times 16 past a palette pointer read from a structure) made one lookup a word group, three dependent loads before
+        // each word: vertex shader b1f06157308e3b22, 64 of its 71 lookups through one pointer, took 9.3 ms of a 59.5 ms frame on the AYN Thor (DM_VK_DRAW_SKIP), and the
+        // foliage's mesh shaders read 128 of their 139 words the same way. The pointer is looked up once, right where it is read, and each load through it takes that delta
+        // when its page lies in the pointer's segment (the page table's bounds, dmsh_abi.h DMSH_GMEM_PT_BOUNDS). shortcut: a word past the pointer's segment reads 0 (as an
+        // address in no pool does), where the page's own lookup could have found another segment: an object across two segments, which only the 16 MiB parts of pools
+        // placed by parts make (vka_mem.c); the full lookup for those words when that shows up
+        private static Operand[] TrySharedBaseLookup(GtsContext gtsContext, int mapBinding, Operand low, Operand high)
+        {
+            if (!FindSharedBase(low, high, out Operand baseLow, out Operand baseHigh))
+            {
+                return null;
+            }
+
+            if (gtsContext.SharedBases.TryGetValue((baseLow, baseHigh), out Operand[] lookup))
+            {
+                return lookup;
+            }
+
+            // Where the pointer is read: its two words in one block, the lookup right after the later
+            LinkedListNode<INode> lowNode = null;
+            LinkedListNode<INode> highNode = null;
+
+            foreach (BasicBlock block in gtsContext.Blocks)
+            {
+                for (LinkedListNode<INode> node = block.Operations.First; node != null; node = node.Next)
+                {
+                    if (node.Value == baseLow.AsgOp)
+                    {
+                        lowNode = node;
+                    }
+
+                    if (node.Value == baseHigh.AsgOp)
+                    {
+                        highNode = node;
+                    }
+                }
+
+                if (lowNode != null || highNode != null)
+                {
+                    break;
+                }
+            }
+
+            LinkedListNode<INode> after = null;
+
+            if (lowNode != null && highNode != null && lowNode.List == highNode.List)
+            {
+                after = lowNode;
+
+                for (LinkedListNode<INode> node = lowNode; node != null; node = node.Next)
+                {
+                    if (node == highNode)
+                    {
+                        after = highNode;
+                        break;
+                    }
+                }
+            }
+
+            if (after == null)
+            {
+                gtsContext.SharedBases[(baseLow, baseHigh)] = null;
+                return null;
+            }
+
+            if (gtsContext.BaseLookupId < 0)
+            {
+                gtsContext.BaseLookupId = gtsContext.AddRawGroup("lookup", EmitBaseLookup(mapBinding));
+            }
+
+            lookup = [Local(), Local(), Local(), Local()];
+            after.List.AddAfter(after, new Operation(Instruction.Call, 0, lookup, [Const(gtsContext.BaseLookupId), baseLow, baseHigh]));
+            gtsContext.SharedBases[(baseLow, baseHigh)] = lookup;
+
+            return lookup;
+        }
+
+        // nxnative: the pointer (baseLow, baseHigh) an address is that pointer plus an offset at: through sums with a constant (BaseCandidates), then a 64-bit sum of two
+        // terms (InstEmitAmpereMem's IADD with its carry: low = a + b, high = (c + d) + (low < a or b)) of which only one was read from memory on each side
+        private static bool FindSharedBase(Operand low, Operand high, out Operand baseLow, out Operand baseHigh)
+        {
+            baseLow = null;
+            baseHigh = null;
+
+            for (int depth = 0; depth < 4; depth++)
+            {
+                List<(Operand Low, Operand High, int Offset)> candidates = BaseCandidates(low, high);
+
+                if (candidates.Count < 2)
+                {
+                    break;
+                }
+
+                (low, high, _) = candidates[1];
+            }
+
+            if (low.AsgOp is not Operation add || add.Inst != Instruction.Add || add.SourcesCount != 2 ||
+                high.AsgOp is not Operation highAdd || highAdd.Inst != Instruction.Add || highAdd.SourcesCount != 2)
+            {
+                return false;
+            }
+
+            for (int index = 0; index < 2; index++)
+            {
+                if (highAdd.GetSource(index).AsgOp is Operation select && select.Inst == Instruction.ConditionalSelect &&
+                    select.GetSource(0).AsgOp is Operation compare && compare.SourcesCount == 2 && compare.GetSource(0) == low &&
+                    (compare.GetSource(1) == add.GetSource(0) || compare.GetSource(1) == add.GetSource(1)) &&
+                    highAdd.GetSource(1 - index).AsgOp is Operation sum && sum.Inst == Instruction.Add && sum.SourcesCount == 2)
+                {
+                    Operand lowTerm = PickLoaded(add.GetSource(0), add.GetSource(1));
+                    Operand highTerm = PickLoaded(sum.GetSource(0), sum.GetSource(1));
+
+                    if (lowTerm != null && highTerm != null)
+                    {
+                        baseLow = lowTerm;
+                        baseHigh = highTerm;
+                        return true;
+                    }
+
+                    return false;
+                }
+            }
+
+            return false;
+        }
+
+        // The one of two terms read from memory, or null when neither or both are
+        private static Operand PickLoaded(Operand a, Operand b)
+        {
+            bool loadedA = IsLoadedValue(a);
+            bool loadedB = IsLoadedValue(b);
+
+            return loadedA == loadedB ? null : loadedA ? a : b;
+        }
+
+        // Whether a value was read from memory (a load, or a helper call that loads, through copies): a pointer, as against an offset computed from indices
+        private static bool IsLoadedValue(Operand value)
+        {
+            for (int depth = 0; depth < 8 && value.AsgOp is Operation op; depth++)
+            {
+                Instruction inst = op.Inst & Instruction.Mask;
+
+                if (inst == Instruction.Call ||
+                    (inst == Instruction.Load && (op.StorageKind is StorageKind.ConstantBuffer or StorageKind.StorageBuffer or StorageKind.LocalMemory or
+                        StorageKind.SharedMemory || IsGlobalMemory(op.StorageKind))))
+                {
+                    return true;
+                }
+
+                if (inst != Instruction.Copy || op.SourcesCount != 1)
+                {
+                    return false;
+                }
+
+                value = op.GetSource(0);
+            }
+
+            return false;
+        }
+
+        // The helper that looks a pointer up: its pool's delta (returned, then its high word), and its segment's first and end page (0 and 0 outside every pool)
+        private static Function EmitBaseLookup(int mapBinding)
+        {
+            EmitterContext context = new();
+
+            Operand MapWord(Operand entry, int word)
+            {
+                return context.Load(StorageKind.StorageBuffer, mapBinding, Const(0), context.IAdd(entry, Const(word)));
+            }
+
+            Operand addrLow = Argument(0);
+            Operand addrHigh = Argument(1);
+
+            Operand inSpace = context.ICompareLessUnsigned(addrHigh, Const(1 << (GmemPtVaBits - 32)));
+            Operand l1 = context.ConditionalSelect(inSpace, context.BitwiseOr(context.ShiftLeft(addrHigh, Const(32 - GmemPtBlockLog2)), context.ShiftRightU32(addrLow, Const(GmemPtBlockLog2))), Const(0));
+            Operand block = MapWord(l1, GmemPtL1Word);
+            Operand page = context.BitwiseAnd(context.ShiftRightU32(addrLow, Const(GmemPtPageLog2)), Const((1 << (GmemPtBlockLog2 - GmemPtPageLog2)) - 1));
+            Operand pageEntry = context.IAdd(block, context.ShiftLeft(page, Const(1)));
+            Operand ptLow = MapWord(pageEntry, 0);
+            Operand inside = context.ICompareNotEqual(context.BitwiseAnd(ptLow, Const(1)), Const(0));
+
+            // (the null block has no bounds: what its pages read there is not used)
+            context.Copy(Argument(2), MapWord(pageEntry, 1));
+            context.Copy(Argument(3), context.ConditionalSelect(inside, MapWord(pageEntry, GmemPtBoundsWord), Const(0)));
+            context.Copy(Argument(4), context.ConditionalSelect(inside, MapWord(pageEntry, GmemPtBoundsWord + 1), Const(0)));
+            context.Return(context.BitwiseAnd(ptLow, Const(~3)));
+
+            return new Function(ControlFlowGraph.Create(context.GetOperations()).Blocks, "GmemBaseLookup", true, 2, 3);
+        }
+
+        // The host address a load of (addrLow, addrHigh) through a pointer looked up by EmitBaseLookup reads, with no branch: the address plus the pointer's delta when its
+        // page is in the pointer's segment, otherwise the zero page (words 0 and 1) at the address's offset in its page, as EmitPageTableLoadAddress reads outside every pool
+        private static void EmitSharedLoadAddress(EmitterContext context, int mapBinding, Operand addrLow, Operand addrHigh, Operand deltaLow, Operand deltaHigh,
+            Operand firstPage, Operand endPage, out Operand hostLow, out Operand hostHigh)
+        {
+            Operand MapWord(int word)
+            {
+                return context.Load(StorageKind.StorageBuffer, mapBinding, Const(0), Const(word));
+            }
+
+            Operand inSpace = context.ICompareLessUnsigned(addrHigh, Const(1 << (GmemPtVaBits - 32)));
+            Operand page = context.BitwiseOr(context.ShiftLeft(addrHigh, Const(32 - GmemPtPageLog2)), context.ShiftRightU32(addrLow, Const(GmemPtPageLog2)));
+            Operand inSegment = context.BitwiseAnd(inSpace, context.ICompareLessUnsigned(context.ISubtract(page, firstPage), context.ISubtract(endPage, firstPage)));
+            Operand baseLow = context.ConditionalSelect(inSegment, deltaLow, context.BitwiseAnd(MapWord(0), Const(~3)));
+            Operand baseHigh = context.ConditionalSelect(inSegment, deltaHigh, MapWord(1));
+            Operand offsetLow = context.ConditionalSelect(inSegment, addrLow, context.BitwiseAnd(addrLow, Const((1 << GmemPtPageLog2) - 1)));
+            Operand offsetHigh = context.ConditionalSelect(inSegment, addrHigh, Const(0));
+
+            hostLow = context.IAdd(baseLow, offsetLow);
+            hostHigh = context.IAdd(context.IAdd(baseHigh, offsetHigh), context.ConditionalSelect(context.ICompareLessUnsigned(hostLow, baseLow), Const(1), Const(0)));
         }
 
         private static uint PackCbSlotAndOffset(int cbSlot, int cbOffset)
