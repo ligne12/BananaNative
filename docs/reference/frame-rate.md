@@ -410,6 +410,7 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Cause:** each lookup of the page table ([Global memory at an address loaded from memory](shaders.md#global-memory-at-an-address-loaded-from-memory)) ended in a branch past the access when the page was outside every segment. After the driver inlined the 71 helpers the shader was a block per access, and Turnip schedules within a block: three dependent table loads, the access's own load, then the next lookup, with nothing to overlap them.
 - **Fix:** loads take their address with no branch: a page outside every segment points them at a zero page instead (`GlobalToStorage.EmitPageTableLoadAddress`, `dmsh_abi.h` `DMSH_GMEM_PT_OUTSIDE` / `DMSH_GMEM_PT_ZERO_BYTES`, `vka_draw.c` `pt_init` / `pt_set`).
 - **Check:** the AYN Thor, 2026-11-07, Kokiri Forest at night, the same view at the same game time: `b1f06157308e3b22` 4,861 instructions (805 NOPs), its three draws timed alone 16.5 → 7.8 ms; the frame p50 60.3 → 56.1 ms, 16.6 → 17.9 fps.
+- **Not taken:** an invocation's cache of its last pool in front of the lookup (a branch around it, taken by most accesses) brings the branch back: on the AYN Thor `b1f06157308e3b22` went from 4,861 to 8,737 instructions and the frame's GPU from 55 to about 280 ms.
 - **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) on the AYN Thor with Turnip, found with `DM_VK_GPUPROF_DRAW` (a timestamp after each draw of the profiled frame).
 
 ### GPU times read with a wrong timestamp period
