@@ -148,21 +148,31 @@ static void pw_load(void); static void pw_start(void); static int pw_save(void);
 static void *saver_main(void *a);
 static pthread_mutex_t g_save_mu = PTHREAD_MUTEX_INITIALIZER;   // one save at a time (the saver thread, a forced save)
 static pthread_mutex_t g_sv_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_sv_cv = PTHREAD_COND_INITIALIZER; static int g_sv_want, g_sv_up;
-// The files of this driver's cache for other shader libraries (<base>-<12 hex>.bin) and the one from before the library named them (<base>.bin): removed. The driver keeps a
-// whole cache in memory, and on the AYN Thor one file had grown to 222 MB with the pipelines of 13 libraries, read back at every start (its save copied it all, a quarter more)
-static void pc_drop_stale(const char *dir, const char *base) {
+// The files of this driver's cache for other shader libraries (<base>-<12 hex>.bin) and the one from before the library named them (<base>.bin). The driver keeps a whole
+// cache in memory, and on the AYN Thor one file had grown to 227 MB with the pipelines of 13 libraries, read back at every start (its save copied it all, a quarter more).
+// When this library has no file yet, the newest of them up to DM_VK_PCACHE_SEED_MB (default 96; 0 none) becomes its file: a new library retranslates few shaders, and the
+// driver finds the pipelines of the others in it (its keys are the modules and the state, not the library). Started empty instead, Ocarina of Time's first run after a
+// library change skipped 116,486 draws while 513 pipelines were made again (DM_VK_PSO_ASYNC, objects drawn late for minutes). The rest are removed
+static void pc_drop_stale(const char *dir, const char *base, const char *path) {
     DIR *d = opendir(dir); if (!d) return;
-    size_t bl = strlen(base); struct dirent *de;
+    size_t bl = strlen(base); struct dirent *de; struct stat st;
+    long long cap = (long long)VKA_ENV("DM_VK_PCACHE_SEED_MB", 96) << 20; char seed[1300] = ""; time_t seed_t = 0; long long seed_sz = 0;
+    int have = !stat(path, &st);
     while ((de = readdir(d))) {
         const char *n = de->d_name, *r = n + bl;
         if (strncmp(n, base, bl)) continue;
         int other = r[0] == '-' && strlen(r) == 17 && strspn(r + 1, "0123456789abcdef") == 12 && !strcmp(r + 13, ".bin") && strncmp(r + 1, DMSH_VK_CHAIN, 12);
         if (strcmp(r, ".bin") && !other) continue;
-        char p[1300]; struct stat st; snprintf(p, sizeof p, "%s/%s", dir, n);
-        long long sz = stat(p, &st) ? -1 : (long long)st.st_size;
-        if (!unlink(p)) VLOG("pipeline cache: %s removed (%lld bytes, another shader library's pipelines)", p, sz);
+        char p[1300]; snprintf(p, sizeof p, "%s/%s", dir, n);
+        if (stat(p, &st)) continue;
+        if (!have && (long long)st.st_size <= cap && (!seed[0] || st.st_mtime > seed_t)) {   // the newest small enough so far: the seed (the one it replaces goes)
+            if (seed[0] && !unlink(seed)) VLOG("pipeline cache: %s removed (%lld bytes, another shader library's pipelines)", seed, seed_sz);
+            snprintf(seed, sizeof seed, "%s", p); seed_t = st.st_mtime; seed_sz = (long long)st.st_size; continue;
+        }
+        if (!unlink(p)) VLOG("pipeline cache: %s removed (%lld bytes, another shader library's pipelines)", p, (long long)st.st_size);
     }
     closedir(d);
+    if (seed[0] && !rename(seed, path)) VLOG("pipeline cache: %s carried over to this shader library (%lld bytes: the pipelines of its shaders the libraries share)", seed, seed_sz);
 }
 static void pc_open_once(void) {
     const char *e = getenv("DM_VK_PCACHE"), *t = getenv("DM_TEMP"), *home = getenv("HOME");
@@ -172,7 +182,7 @@ static void pc_open_once(void) {
         const char *dt = vka_driver_tag(), *dir = t && *t ? t : home;
         char base[512]; snprintf(base, sizeof base, "vk_pipelines%s%s", dt ? "-" : "", dt ? dt : "");
         snprintf(g_pc_path, sizeof g_pc_path, "%s/%s-%s.bin", dir, base, DMSH_VK_CHAIN);
-        pc_drop_stale(dir, base);
+        pc_drop_stale(dir, base, g_pc_path);
     }
     // The prewarm list (pw_*): the pipeline keys of earlier runs, whatever the driver (a key names shaders and state, not driver code). DM_VK_PREWARM_FILE overrides
     const char *pf = getenv("DM_VK_PREWARM_FILE");
