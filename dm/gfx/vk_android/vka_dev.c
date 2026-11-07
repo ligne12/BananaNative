@@ -234,10 +234,23 @@ int vka_init(void) {
 }
 int vka_ok(void) { return __atomic_load_n(&g_state, __ATOMIC_ACQUIRE) > 0; }
 
+// A submission with a fence value signals a binary VkFence of its own, which the completion thread waits for; the timeline semaphore V.tl is no longer signalled or waited
+// for. Turnip on KGSL emulates timeline semaphores (Mesa vk_sync_timeline), and before Mesa e984ef294e (2026-10-08) the zero-timeout check it makes of a timeline point
+// was a wait without end (KGSL takes a 0 timeout as forever): vkWaitSemaphores waited for the oldest point and vkGetSemaphoreCounterValue for every point queued, both
+// holding the timeline's lock, which the next vkQueueSubmit needs. The completion thread's wait so held back the present's submission (under V.qmu) and the replay's behind it
+// until the GPU was idle: CPU and GPU took turns every frame (Ocarina of Time, Link's house: 18 fps, the replay thread blocked ~25 ms a frame). A later submission on the queue
+// needs no wait for an earlier one: its first barrier's scope holds every command earlier in submission order, and so does a fence's signal
+enum { GF_RING = 64 };   // more than NSLOT (vka_exec.c): a value GF_RING back is done before a replay command buffer is recorded again, so its fence is free
+static struct { uint64_t val; VkFence f; } g_gf[GF_RING];   // val: the fence value whose submission this fence signals (written under V.qmu, read after vka_fence_post)
 VkResult vka_submit(VkCommandBuffer cb, uint64_t signal, uint32_t nwait, const VkSemaphore *wait, const uint64_t *wait_vals, const VkPipelineStageFlags *stages, VkSemaphore bin_signal) {
-    VkSemaphore sig[2]; uint64_t sv[2]; uint32_t ns = 0;
-    if (signal) { sig[ns] = V.tl; sv[ns++] = signal; }
+    VkSemaphore sig[1]; uint64_t sv[1]; uint32_t ns = 0;
     if (bin_signal) { sig[ns] = bin_signal; sv[ns++] = 0; }
+    VkFence gf = VK_NULL_HANDLE;
+    if (signal) {
+        unsigned k = (unsigned)(signal % GF_RING); VkFenceCreateInfo fi = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        if (g_gf[k].f ? vk.vkResetFences(V.dev, 1, &g_gf[k].f) : vk.vkCreateFence(V.dev, &fi, NULL, &g_gf[k].f)) VRED_ONCE("submission fence not made or reset: its completion is taken from the next one");
+        else gf = g_gf[k].f;
+    }
     // The waits, and one more for the sparse binds queued before it (vks_queue_locked)
     VkSemaphore ws[9]; uint64_t wv[9]; VkPipelineStageFlags wst[9];
     if (nwait > 8) { VRED_ONCE("vka_submit: %u waits, at most 8 taken: the rest are dropped", nwait); nwait = 8; }
@@ -247,18 +260,17 @@ VkResult vka_submit(VkCommandBuffer cb, uint64_t signal, uint32_t nwait, const V
     VkTimelineSemaphoreSubmitInfo ti = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, .waitSemaphoreValueCount = nwait, .pWaitSemaphoreValues = wv, .signalSemaphoreValueCount = ns, .pSignalSemaphoreValues = sv};
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, .pNext = &ti, .waitSemaphoreCount = nwait, .pWaitSemaphores = ws, .pWaitDstStageMask = wst,
                        .commandBufferCount = cb ? 1 : 0, .pCommandBuffers = &cb, .signalSemaphoreCount = ns, .pSignalSemaphores = sig};
-    VkResult r = vka_hung() ? VK_ERROR_DEVICE_LOST : vk.vkQueueSubmit(V.q, 1, &si, VK_NULL_HANDLE);
+    VkResult r = vka_hung() ? VK_ERROR_DEVICE_LOST : vk.vkQueueSubmit(V.q, 1, &si, gf);
+    if (!r && gf) g_gf[signal % GF_RING].val = signal;
     if (!r && signal > V.tl_queued) __atomic_store_n(&V.tl_queued, signal, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&V.qmu);
     return r;
 }
-// The queue idle, bounded by the hang time: the timeline up to the last value handed to it (the present's copies wait for no more), then vkQueueWaitIdle for the rest
+// The queue idle, bounded by the hang time: the fences up to the last value handed to it (the present's copies wait for no more), then vkQueueWaitIdle for the rest
 int vka_queue_idle(void) {
     if (vka_hung()) return 0;
     uint64_t q = vka_fence_queued();
-    VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &V.tl, .pValues = &q};
-    VkResult r = q ? vk.vkWaitSemaphores(V.dev, &wi, vka_hang_ns()) : VK_SUCCESS;
-    if (r) { VRED("queue idle: fence %llu not reached in %.1f s (%d): not waited for", (unsigned long long)q, vka_hang_ns() / 1e9, r); return 0; }
+    if (!vka_wait_done(q, vka_hang_ns())) { VRED("queue idle: fence %llu not reached in %.1f s: not waited for", (unsigned long long)q, vka_hang_ns() / 1e9); return 0; }
     pthread_mutex_lock(&V.qmu); vk.vkQueueWaitIdle(V.q); pthread_mutex_unlock(&V.qmu);
     return 1;
 }
@@ -342,12 +354,15 @@ static void *completion_main(void *arg) {
         // Wait for the next fence, not the last one handed to the queue: each fence is published (and its waiters woken) when the GPU reaches it. Waiting for the last one
         // held every earlier fence back until all work queued at that moment had run: Donkey Kong Bananza waits for its previous frame's last fence after queueing two
         // submissions of the next frame, so its wait ended only when those were done too. DM_VK_DONE_LAST=1 (live) waits for the last one, as before, for A/B runs
-        uint64_t sub = g_submitted, done = g_done, want = VKA_ENV("DM_VK_DONE_LAST", 0) ? sub : done + 1; pthread_mutex_unlock(&g_fmu);
-        uint64_t v = 0;
-        if (!vka_hung()) {
-            VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &V.tl, .pValues = &want};
-            VkResult r = vk.vkWaitSemaphores(V.dev, &wi, 500000000ull);
-            vk.vkGetSemaphoreCounterValue(V.dev, V.tl, &v);
+        uint64_t sub = g_submitted, done = g_done; int last = VKA_ENV("DM_VK_DONE_LAST", 0); pthread_mutex_unlock(&g_fmu);
+        // The fence waited for: the first value after done whose submission has one (the last, with DM_VK_DONE_LAST); a value without one (no GPU work: a submission
+        // refused, or none recorded) is done with what is before it
+        uint64_t want = 0, v = sub;
+        for (uint64_t f = done + 1; f <= sub; f++) if (g_gf[f % GF_RING].val == f) { want = f; if (!last) break; }
+        if (want && !vka_hung()) {
+            VkResult r = vk.vkWaitForFences(V.dev, 1, &g_gf[want % GF_RING].f, VK_TRUE, 500000000ull);
+            v = r ? done : want;
+            while (!r && v < sub && g_gf[(v + 1) % GF_RING].val != v + 1) v++;
             uint64_t t = now_ns();
             if (r == VK_TIMEOUT && v <= done) {   // no progress in this wait
                 if (!stall_t0 || stall_at != done) { stall_t0 = t - 500000000ull; stall_at = done; stall_logged = 0; }
@@ -356,7 +371,7 @@ static void *completion_main(void *arg) {
                 if (t - stall_t0 < vka_hang_ns()) continue;
                 hang_declare(want, v, st, "no progress");
             } else if (r && r != VK_TIMEOUT) {
-                char w[64]; snprintf(w, sizeof w, "vkWaitSemaphores %d (the device is lost)", r);
+                char w[64]; snprintf(w, sizeof w, "vkWaitForFences %d (the device is lost)", r);
                 hang_declare(want, v, 0, w);
             } else stall_t0 = 0;
         }

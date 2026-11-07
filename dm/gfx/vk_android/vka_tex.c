@@ -154,10 +154,26 @@ static int tex_lazy(void) { static int v = -1; if (v < 0) v = VKA_ENV("DM_VK_TEX
 enum { POOL_MARK_BINDING = 3, POOL_MARK_WORDS = (1 << 20) / 32 };
 static _Atomic uint32_t *g_pm; static vka_span g_pm_span; static uint64_t g_pm_woken;
 static pthread_once_t g_pm_once = PTHREAD_ONCE_INIT;
+// The CPU reads the bitmap an ID at a time at every flush (lazy_wake): in host-cached memory. In the static block's uncached memory those reads were a third of the replay
+// thread's time (Ocarina of Time, Link's house: 5,000 IDs waiting, 7 flushes a frame, ~10 ms a frame on the Adreno 840)
+static int pm_cached(VkDeviceSize n) {
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = n, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT};
+    VkBuffer b; VkDeviceMemory m = VK_NULL_HANDLE; VkMemoryRequirements mr; void *p = NULL;
+    if (vk.vkCreateBuffer(V.dev, &bi, NULL, &b)) return 0;
+    vk.vkGetBufferMemoryRequirements(V.dev, b, &mr);
+    uint32_t t = vka_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 0);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = t};
+    if (t == UINT32_MAX || vk.vkAllocateMemory(V.dev, &ai, NULL, &m) || vk.vkBindBufferMemory(V.dev, b, m, 0) || vk.vkMapMemory(V.dev, m, 0, VK_WHOLE_SIZE, 0, &p)) {
+        if (m) vk.vkFreeMemory(V.dev, m, NULL);
+        vk.vkDestroyBuffer(V.dev, b, NULL); return 0;
+    }
+    g_pm_span = (vka_span){b, p, 0}; return 1;
+}
 static void pm_init(void) {
     if (!tex_lazy() || !VKA_ENV("DM_VK_POOL_MARK", 1)) return;
     if (!V.frag_atomics || !V.vert_atomics) { VRED("texture pool read marks: the device has no stores in fragment or vertex shaders: IDs read through the pool keep the null view"); return; }
-    if (!vka_static((VkDeviceSize)POOL_MARK_WORDS * 4, V.sb_align ? V.sb_align : 64, &g_pm_span)) { VRED("texture pool read marks: no memory for the bitmap"); return; }
+    if (!pm_cached((VkDeviceSize)POOL_MARK_WORDS * 4)) VRED("texture pool read marks: no host-cached memory for the bitmap: uncached, slow to read");
+    if (!g_pm_span.ptr && !vka_static((VkDeviceSize)POOL_MARK_WORDS * 4, V.sb_align ? V.sb_align : 64, &g_pm_span)) { VRED("texture pool read marks: no memory for the bitmap"); return; }
     memset(g_pm_span.ptr, 0, (size_t)POOL_MARK_WORDS * 4); g_pm = (_Atomic uint32_t *)(void *)g_pm_span.ptr;
     VLOG("texture pool read marks: shaders that read the pool set the read IDs' bits (DM_VK_POOL_MARK=0 off)");
 }

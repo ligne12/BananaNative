@@ -211,6 +211,8 @@ static void gpu_slot_done(unsigned slot) {   // the slot's fence is done: its tw
         atomic_fetch_add(&g_gpu[k].ns, (uint64_t)(busy * g_ts_ns)); atomic_fetch_add(&g_gpu[k].span, s1 - s0);
         if (s0 < atomic_load(&g_gpu[k].t0)) atomic_store(&g_gpu[k].t0, s0);
         if (s1 > atomic_load(&g_gpu[k].t1)) atomic_store(&g_gpu[k].t1, s1);
+        if (atomic_load_explicit(&g_synclog, memory_order_relaxed) > 0)   // the gaps between submissions on the GPU (its own clock: not the host's ms)
+            VLOG("sync gpu: frame %llu fence %llu: %.2f-%.2f ms GPU clock, busy %.2f ms", (unsigned long long)f, (unsigned long long)g_slot[slot].fence, (s0 % 1000000000000ull) / 1e6, (s1 % 1000000000000ull) / 1e6, busy * g_ts_ns / 1e6);
     }
     atomic_fetch_sub(&g_gpu[k].pending, 1);
 }
@@ -364,12 +366,9 @@ uint64_t vka_rp_sub_commit(uint64_t reserved) {
     vka_scratch_retire(fence);
     if (r) {
         static _Atomic int nred; if (atomic_fetch_add(&nred, 1) < 8) VRED("submission %llu: %d (its effects run without the GPU)", (unsigned long long)fence, r);
-        VkSemaphoreSignalInfo si = {VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = V.tl, .value = fence};
-        pthread_mutex_lock(&V.qmu);   // signalled by the host: later submissions may wait for it
-        VkResult sr = vka_hung() ? VK_ERROR_DEVICE_LOST : vk.vkSignalSemaphore(V.dev, &si);
-        if (!sr && fence > V.tl_queued) __atomic_store_n(&V.tl_queued, fence, __ATOMIC_RELEASE);
+        pthread_mutex_lock(&V.qmu);   // counts as handed to the queue (a present may name it); with no fence of its own, the completion thread takes it as done after what is before it
+        if (fence > V.tl_queued) __atomic_store_n(&V.tl_queued, fence, __ATOMIC_RELEASE);
         pthread_mutex_unlock(&V.qmu);
-        if (sr) { vka_fence_cpu(fence, ops, n, post_run); g_cb = VK_NULL_HANDLE; return fence; }
     }
     vka_fence_post(fence, ops, n, post_run);
     if (atomic_load_explicit(&g_synclog, memory_order_relaxed) > 0)

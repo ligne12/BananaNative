@@ -103,7 +103,7 @@ typedef struct {
     VkSemaphore tl;                                 // the timeline: value n = submission n has completed
     pthread_mutex_t qmu;                            // the queue is shared by the submit and present threads
     int sparse_res;                                 // sparse residency images can be made (vka_sparse.c): binding on the queue, 2D residency, standard block shape, strict non-resident reads
-    uint64_t tl_queued;                             // the highest timeline value a vkQueueSubmit so far signals (under qmu): what a later submission on the queue may wait for
+    uint64_t tl_queued;                             // the highest fence value handed to the queue so far (under qmu): a later submission on the queue comes after its work
 } vka_dev;
 extern vka_dev V;
 // Custom GPU drivers (vka_driver.c): DM_VK_DRIVER=<folder with meta.json, or a .so> loads that driver through libadrenotools (restart only); unset, empty or "system" = the
@@ -118,7 +118,7 @@ VkResult vka_submit(VkCommandBuffer cb, uint64_t signal, uint32_t nwait, const V
 // The fence ledger: fence n is "done" once the GPU passed it and its CPU-side effects (events, counters) have run
 uint64_t vka_fence_next(void);                      // reserve the next fence value (submit thread)
 uint64_t vka_fence_last(void);                      // the last fence reserved (its submission may still be recording on another thread)
-uint64_t vka_fence_queued(void);                    // the last fence handed to the queue: the most a submission (the present's) may wait for without a wait-before-signal on its own queue
+uint64_t vka_fence_queued(void);                    // the last fence handed to the queue: the most a submission (the present's) may name, its work being earlier on the queue
 // The replay (vka_exec.c), entered by the replay worker (vka_worker.c) or inline by the mtl_* calls of the submitting thread
 void vka_rp_sub_begin(void);
 void vka_rp_exec(const uint8_t *handle, uint64_t fence);   // fence: the submission's, reserved before it (0 = taken at its commit)

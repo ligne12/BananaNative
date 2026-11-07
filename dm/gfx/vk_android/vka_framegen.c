@@ -217,10 +217,9 @@ int vka_fg_frame(uint64_t serial, const int *crop, double period, uint64_t fence
     for (size_t g = 0; g < ng; g++) lsfg_chain_generate(F.chain, cb, count, ng, g);
     vka_barrier(cb);   // the outputs for the presents after this
     vk.vkEndCommandBuffer(cb);
-    VkPipelineStageFlags st = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-    VkTimelineSemaphoreSubmitInfo ti = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, .waitSemaphoreValueCount = 1, .pWaitSemaphoreValues = &fence};
-    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, .pNext = &ti, .waitSemaphoreCount = fence ? 1 : 0, .pWaitSemaphores = &V.tl, .pWaitDstStageMask = &st,
-                       .commandBufferCount = 1, .pCommandBuffers = &cb};
+    // No wait for the replay's submission (fence): it is earlier on the queue, and the first barrier above covers it (vka_submit: the timeline semaphore is not signalled)
+    (void)fence;
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
     pthread_mutex_lock(&V.qmu); VkResult r = vk.vkQueueSubmit(V.q, 1, &si, F.fr[k].fence); pthread_mutex_unlock(&V.qmu);
     F.fr[k].held = im;   // the window texture stays alive until this submission is done
     if (r) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) VRED("frame generation submission %d", r); ng = 0; }

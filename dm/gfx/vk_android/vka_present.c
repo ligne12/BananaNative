@@ -526,11 +526,12 @@ static int present_one(const pq_item *it) {
     if (blit >= 0) vka_img_barrier(cb, g_simg[idx], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     if (!it->src) vka_ctl_shot_record(cb, im, cx, cy, cw, ch);   // the game's own frames only
     vk.vkEndCommandBuffer(cb);
+    // The copy waits for the acquire only: the replay's submissions up to it->fence are earlier on the queue, and the copy's first barrier covers every command earlier in
+    // submission order (no wait on the timeline semaphore: vka_submit says why). V.tl, never signalled, is waited for only by the test switch below
     VkSemaphore ws[2] = {g_fr[k].acq, V.tl}; uint64_t wv[2] = {0, it->fence}; VkPipelineStageFlags st[2] = {VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT};   // the image's first barrier is ALL_COMMANDS
-    VkTimelineSemaphoreSubmitInfo ti = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, .waitSemaphoreValueCount = 2, .pWaitSemaphoreValues = wv, .signalSemaphoreValueCount = 1, .pSignalSemaphoreValues = wv};
-    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, .pNext = &ti, .waitSemaphoreCount = it->fence ? 2 : 1, .pWaitSemaphores = ws, .pWaitDstStageMask = st,
+    VkTimelineSemaphoreSubmitInfo ti = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, .waitSemaphoreValueCount = 1, .pWaitSemaphoreValues = wv, .signalSemaphoreValueCount = 1, .pSignalSemaphoreValues = wv};
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, .pNext = &ti, .waitSemaphoreCount = 1, .pWaitSemaphores = ws, .pWaitDstStageMask = st,
                        .commandBufferCount = 1, .pCommandBuffers = &cb, .signalSemaphoreCount = 1, .pSignalSemaphores = &g_sdone[idx]};
-    if (!it->fence) ti.waitSemaphoreValueCount = 1;
     frame_rate(it->period); refresh_poll();
     uint64_t want = 0, period = (uint64_t)((it->hold > 0 ? it->hold : it->period) * 1e9);
     if (g_refresh_ns && period > g_refresh_ns * 3 / 2) {   // hold each image for its present period: the panel refreshes faster than the game presents
@@ -542,15 +543,13 @@ static int present_one(const pq_item *it) {
     VkPresentTimesInfoGOOGLE ptv = {VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE, .swapchainCount = 1, .pTimes = &pt};
     VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .pNext = V.display_timing ? &ptv : NULL, .waitSemaphoreCount = 1, .pWaitSemaphores = &g_sdone[idx], .swapchainCount = 1, .pSwapchains = &g_swap, .pImageIndices = &idx};
     pthread_mutex_lock(&V.qmu);
-    // Never a wait for a value no earlier submission signals: the queue runs its batches in order, so the copy would wait for a submission queued behind it, and neither ever
-    // runs (mtl_present takes vka_fence_queued for that; this holds it under the queue lock)
-    if (wv[1] > V.tl_queued) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 4) VRED("present ticket %llu waited for fence %llu, %llu is the last handed to the queue: waits for that", (unsigned long long)it->ticket, (unsigned long long)wv[1], (unsigned long long)V.tl_queued); wv[1] = V.tl_queued; }
-    // Test switch DM_VK_TEST_HANG=<mode>,<ticket>: at that present the copy waits for a timeline value no earlier batch signals, as the present did before it took
-    // vka_fence_queued. Mode 1: the next fence (a later submission signals it: the wait-before-signal on one queue); mode 2: a value nothing ever signals (a sure stall, for
-    // the hang handling). Not set in the product
+    // The submission it->fence is on the queue already (mtl_present takes vka_fence_queued; this holds it under the queue lock), so the copy comes after its writes
+    if (wv[1] > V.tl_queued) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 4) VRED("present ticket %llu names fence %llu, %llu is the last handed to the queue: the copy may run before its writes", (unsigned long long)it->ticket, (unsigned long long)wv[1], (unsigned long long)V.tl_queued); }
+    // Test switch DM_VK_TEST_HANG=<mode>,<ticket>: at that present the copy waits for a value of V.tl, which nothing signals (a sure stall, for the hang handling; both modes
+    // since the replay stopped signalling V.tl). Not set in the product
     { static int mode = -1, at; if (mode < 0) { const char *e = getenv("DM_VK_TEST_HANG"); mode = 0; if (e && sscanf(e, "%d,%d", &mode, &at) < 1) mode = 0; if (at <= 0) at = 600; }
-      if (mode && it->ticket == (uint64_t)at && it->fence) { wv[1] = mode == 1 ? vka_fence_last() + 1 : V.tl_queued + 1000000000ull;
-          VRED("DM_VK_TEST_HANG=%d: present ticket %llu waits for fence %llu (%llu handed to the queue)", mode, (unsigned long long)it->ticket, (unsigned long long)wv[1], (unsigned long long)V.tl_queued); } }
+      if (mode && it->ticket == (uint64_t)at) { wv[1] = 1; si.waitSemaphoreCount = 2; ti.waitSemaphoreValueCount = 2;
+          VRED("DM_VK_TEST_HANG=%d: present ticket %llu waits for a timeline value nothing signals", mode, (unsigned long long)it->ticket); } }
     r = vka_hung() ? VK_ERROR_DEVICE_LOST : vk.vkQueueSubmit(V.q, 1, &si, g_fr[k].fence);
     VkResult pr = r ? r : vk.vkQueuePresentKHR(V.q, &pi);
     pthread_mutex_unlock(&V.qmu);
