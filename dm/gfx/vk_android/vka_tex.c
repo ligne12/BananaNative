@@ -115,7 +115,17 @@ static VkImageAspectFlags aspect_of(int kind) { return kind == 3 ? VK_IMAGE_ASPE
 static int compressed(const vka_fmt *f) { return f->bw > 1 || f->bh > 1; }
 
 uint64_t vka_n_bar;   // full barriers recorded (vka_exec.c replay statistics)
+// DM_VK_BAR_SKIP=<file:line>[,<file:line>…] (live, diagnostic: the picture may break): the full barriers of those sites (DM_VK_GPUPROF's names) are not recorded, to
+// measure what a site's barriers cost the GPU before making them narrower
+static int bar_skip(const char *file, int line) {
+    static _Thread_local char set[512]; static _Thread_local uint32_t gen = ~0u;
+    if (atomic_load_explicit(&vka_env_gen, memory_order_relaxed) != gen) { gen = atomic_load(&vka_env_gen); const char *e = getenv("DM_VK_BAR_SKIP"); snprintf(set, sizeof set, ",%s,", e ? e : ""); }
+    if (!set[1] || set[1] == ',') return 0;
+    char site[96]; snprintf(site, sizeof site, ",%s:%d,", file, line);
+    return strstr(set, site) != NULL;
+}
 void vka_barrier_at(VkCommandBuffer cb, const char *file, int line) {
+    if (bar_skip(file, line)) return;
     vka_n_bar++;
     VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT, .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
     vk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
