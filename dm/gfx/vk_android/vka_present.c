@@ -58,6 +58,7 @@ static int g_recreate;
 static struct { uint64_t n; double t; } g_pres[PRING];
 static VkSurfaceTransformFlagBitsKHR g_pre = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;   // the swapchain's preTransform
 static VkImageView g_sview[MAXIMG];   // the swapchain images as colour attachments (pre-rotation and FSR only)
+static int g_sview_fsr;   // this swapchain made its views for FSR: a missing view then failed, and a new swapchain would not have it either
 static int g_fps_set; static unsigned g_refresh_n;
 static _Atomic int g_place_x = 5000, g_place_y = 5000;   // nxhost_picture_place, in 1/10000 of the free space
 void nxhost_picture_place(float x, float y) {
@@ -235,13 +236,18 @@ static int fsr_ready(VkFormat fmt) {
     VLOG("FSR 1 upscale on (RCAS sharpness %.2f stops)", VKA_ENVF("DM_VK_FSR_SHARP", 0.25));
     return 1;
 }
-// Frame k's intermediate image at w x h: made again when the size changes (frame k's fence is waited for, so nothing reads the old one). 1 = ready
-static int fsr_mid(unsigned k, uint32_t w, uint32_t h) {
-    if (g_fsr.mid[k] && g_fsr.mw[k] == w && g_fsr.mh[k] == h) return 1;
+// Frame k's intermediate image freed: only frame k's submissions use it, so the caller has waited for frame k's fence (or the queue idle). Its descriptor set
+// g_fsr.set[k][1] is written again before its next use
+static void fsr_free(unsigned k) {
     if (g_fsr.view[k]) vk.vkDestroyImageView(V.dev, g_fsr.view[k], NULL);
     if (g_fsr.mid[k]) vk.vkDestroyImage(V.dev, g_fsr.mid[k], NULL);
     if (g_fsr.mem[k]) vk.vkFreeMemory(V.dev, g_fsr.mem[k], NULL);
     g_fsr.view[k] = VK_NULL_HANDLE; g_fsr.mid[k] = VK_NULL_HANDLE; g_fsr.mem[k] = VK_NULL_HANDLE; g_fsr.mw[k] = g_fsr.mh[k] = 0;
+}
+// Frame k's intermediate image at w x h: made again when the size changes (frame k's fence is waited for, so nothing reads the old one). 1 = ready
+static int fsr_mid(unsigned k, uint32_t w, uint32_t h) {
+    if (g_fsr.mid[k] && g_fsr.mw[k] == w && g_fsr.mh[k] == h) return 1;
+    fsr_free(k);
     VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM, .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1,
         .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT};
     VkResult r = vk.vkCreateImage(V.dev, &ci, NULL, &g_fsr.mid[k]);
@@ -258,9 +264,12 @@ static int fsr_mid(unsigned k, uint32_t w, uint32_t h) {
 }
 static uint32_t fsr_bits(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
 // The texture's crop [cx, cx + cw) x [cy, cy + ch) scaled to [dx, dx + dw) x [dy, dy + dh) of swapchain image idx, the rest black. The constants are AMD's FsrEasuConOffset and
-// FsrRcasCon (ffx_fsr1.h) in C; for a lower-left origin (the texture stored bottom-up) EASU's rows are read from the bottom: con0's y scale negated and its offset from the crop's top
-static void fsr_copy(VkCommandBuffer cb, unsigned k, uint32_t idx, vka_img *im, int cx, int cy, int cw, int ch, int dx, int dy, int dw, int dh) {
+// FsrRcasCon (ffx_fsr1.h) in C; for a lower-left origin (the texture stored bottom-up) EASU's rows are read from the bottom: con0's y scale negated and its offset from the crop's top.
+// 0 = nothing recorded (the texture has no view to sample): the caller blits
+static int fsr_copy(VkCommandBuffer cb, unsigned k, uint32_t idx, vka_img *im, int cx, int cy, int cw, int ch, int dx, int dy, int dw, int dh) {
     VkImageView src = vka_view(im, im->f.vk, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1, NULL);
+    if (!src) { VRED_ONCE("FSR: window texture serial %llu (format %#x) has no view to sample: blitted", (unsigned long long)im->serial, im->d.format); return 0; }
+    vka_barrier(cb);   // the replay's writes to the window texture (earlier submissions, in submission order)
     VkDescriptorImageInfo ii[2] = {{g_fsr.samp, src, VK_IMAGE_LAYOUT_GENERAL}, {g_fsr.samp, g_fsr.view[k], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
     VkWriteDescriptorSet w[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g_fsr.set[k][0], .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii[0]},
                                  {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g_fsr.set[k][1], .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii[1]}};
@@ -310,11 +319,13 @@ static void fsr_copy(VkCommandBuffer cb, unsigned k, uint32_t idx, vka_img *im, 
     rk.vkCmdDraw(cb, 3, 1, 0, 0);
     vk.vkCmdEndRendering(cb);
     vka_img_barrier(cb, g_simg[idx], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    return 1;
 }
 
 static void swap_destroy(int surface_too) {
     if (!V.dev) return;
     vka_queue_idle();
+    if (surface_too) for (unsigned k = 0; k < NFRAME; k++) fsr_free(k);   // the window is gone (the queue is idle); a new one makes them at its own size
     for (int i = 0; i < NFRAME; i++) if (g_fr[i].held) { vka_tex_drop(g_fr[i].held); g_fr[i].held = NULL; }
     for (uint32_t i = 0; i < g_nimg; i++) {
         vk.vkDestroySemaphore(V.dev, g_sdone[i], NULL); g_sdone[i] = VK_NULL_HANDLE;
@@ -361,7 +372,7 @@ static int swap_create(void) {
         g_nimg = 0; vk.vkDestroySwapchainKHR(V.dev, old, NULL); g_swap = VK_NULL_HANDLE;
     }
     if (r) { VRED("vkCreateSwapchainKHR %ux%u format %d: %d", ext.width, ext.height, pick.format, r); return 0; }
-    g_swap = sw; g_swap_fmt = pick.format; g_ext = ext; g_pre = pre;
+    g_swap = sw; g_swap_fmt = pick.format; g_ext = ext; g_pre = pre; g_sview_fsr = fsr_wanted();
     g_nimg = MAXIMG; vk.vkGetSwapchainImagesKHR(V.dev, sw, &g_nimg, g_simg);
     VkSemaphoreCreateInfo sci = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     for (uint32_t i = 0; i < g_nimg; i++) {
@@ -478,6 +489,7 @@ static int present_one(const pq_item *it) {
     for (VkResult w; !vka_hung() && (w = vk.vkWaitForFences(V.dev, 1, &g_fr[k].fence, VK_TRUE, 100000000ull)) == VK_TIMEOUT;) {}
     if (vka_hung()) { VRED_ONCE("GPU hang: nothing more is presented"); vka_tex_drop(im); return 0; }
     if (g_fr[k].held) { vka_tex_drop(g_fr[k].held); g_fr[k].held = NULL; }
+    if (g_fsr.mid[k] && !fsr_wanted()) fsr_free(k);   // FSR switched off live: frame k's fence is signalled, so its intermediate image is no longer read
     uint32_t idx; uint64_t t0 = now_ns();
     VkResult r = vk.vkAcquireNextImageKHR(V.dev, g_swap, 1000000000ull, g_fr[k].acq, VK_NULL_HANDLE, &idx);
     g_drawable_ns += now_ns() - t0;
@@ -495,13 +507,16 @@ static int present_one(const pq_item *it) {
     int dw = (int)(cw * s + 0.5), dh = (int)(ch * s + 0.5), dx = (int)((long)(ew - dw) * g_place_x / 10000), dy = (int)((long)(eh - dh) * g_place_y / 10000);   // nxhost_picture_place
     VkFormatProperties fp = {0}; if (im) vk.vkGetPhysicalDeviceFormatProperties(V.pd, im->f.vk, &fp);
     int blit = im && im->inited && im->aspect == VK_IMAGE_ASPECT_COLOR_BIT && im->f.kind == 0 && im->samples == 1 && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT);
-    // FSR in place of the blit or the rotated copy for a picture scaled up; switched on live, the swapchain has no attachment views yet: blitted once, and the next swapchain has them
+    // FSR in place of the blit or the rotated copy for a picture scaled up; switched on live, the swapchain has no attachment views yet: blitted once, and the next swapchain has them.
+    // A view that failed on a swapchain made for FSR is not asked for again: each present would make a new swapchain (a queue idle) and fail the same way
     int fsr = blit > 0 && fsr_wanted() && (dw > cw || dh > ch) && (im->usage & VK_IMAGE_USAGE_SAMPLED_BIT)
               && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT);
-    if (fsr && !g_sview[idx]) { g_recreate = 1; fsr = 0; }
-    if (fsr && fsr_ready(g_swap_fmt) && fsr_mid(k, (uint32_t)dw, (uint32_t)dh)) {
-        vka_barrier(cb);   // the replay's writes to the window texture (earlier submissions, in submission order)
-        fsr_copy(cb, k, idx, im, cx, cy, cw, ch, dx, dy, dw, dh);
+    if (fsr && !g_sview[idx]) {
+        if (!g_sview_fsr) g_recreate = 1;
+        else VRED_ONCE("FSR: swapchain image %u has no attachment view: blitted", idx);
+        fsr = 0;
+    }
+    if (fsr && fsr_ready(g_swap_fmt) && fsr_mid(k, (uint32_t)dw, (uint32_t)dh) && fsr_copy(cb, k, idx, im, cx, cy, cw, ch, dx, dy, dw, dh)) {
         blit = -1;
     } else if (rot_rotates(g_pre)) {
         int ok = im && im->inited && im->aspect == VK_IMAGE_ASPECT_COLOR_BIT && im->f.kind == 0 && im->samples == 1 && (im->usage & VK_IMAGE_USAGE_SAMPLED_BIT) && g_sview[idx];

@@ -19,16 +19,17 @@ the Mac, iPhone and iPad with Metal.
 
 ## Games
 
-| Title ID | Version | Status |
-|---|---|---|
-| `040074A01BF12000` | update 458752 | Works |
-| `0400C3F00006E000` | 1.8.0 (base game) | Work in progress: in game and driving, with graphics problems |
+| Game | Title ID | Version | Status |
+|---|---|---|---|
+| Donkey Kong Bananza | `040074A01BF12000` | update 458752 | Works |
+| Mario Kart World | `0400C3F00006E000` | 1.8.0 (base game) | Work in progress: in game and driving, with graphics problems |
+| Pokémon Pokopia | `0400A3A01EE4C000` | update 655360 (Ver. 2.0.1) | Works, about 60 fps, on the system driver and Turnip |
 
 Only these versions run; the app tells you if your dump is a different one.
 
 ## Performance
 
-`040074A01BF12000` on the tested phone (Snapdragon 8 Elite Gen 5, 16 GB), first level, frame generation off:
+Donkey Kong Bananza (`040074A01BF12000`) on the tested phone (Snapdragon 8 Elite Gen 5, 16 GB), first level, frame generation off:
 
 | GPU driver | Resolution | Frame rate |
 |---|---|---|
@@ -37,14 +38,14 @@ Only these versions run; the app tells you if your dump is a different one.
 
 Both drivers are held at 30 fps by the CPU (recording the frame's GPU work); 60 fps is planned.
 
-`0400C3F00006E000`: not measured yet. Your numbers depend on the phone, its temperature and power mode. The first visit to
+Mario Kart World (`0400C3F00006E000`): not measured yet. Your numbers depend on the phone, its temperature and power mode. The first visit to
 an area stutters while shaders are built, and a hot phone throttles: a cooler helps. Frame generation (Settings) can
 take 30 fps to a 60 / 90 / 120 fps target, with some added latency.
 
 ## What you need
 
 - An Android 13+ phone with a Snapdragon (Adreno) GPU and at least 12 GB of RAM. Tested on a Snapdragon 8 Elite Gen 5 with 16 GB.
-- A phone cooler is recommended, strongly for `0400C3F00006E000`.
+- A phone cooler is recommended, strongly for Mario Kart World (`0400C3F00006E000`).
 - Tested only with the phone's own Qualcomm (system) GPU driver and the latest Turnip; other drivers may not work.
 - Your own dump of the game as a folder. No keys or firmware are needed; NSP and XCI files don't work.
   ```
@@ -76,7 +77,7 @@ pack and is ready to play.
 ### Phone only
 
 Copy the game folder to the phone, install the APK, **Add game**, then **Prepare**. It runs in the background and can
-be paused; keep the phone on the charger. Phone-only setup works for `040074A01BF12000` for now: `0400C3F00006E000`
+be paused; keep the phone on the charger. Phone-only setup works for Donkey Kong Bananza (`040074A01BF12000`) for now: Mario Kart World (`0400C3F00006E000`)
 runs out of memory while its code is rewritten on the phone, so use a Mac for that one.
 
 If something doesn't work, start with Settings › **Readiness check**. A game's ⋯ menu has **Share log**.
@@ -89,15 +90,18 @@ If something doesn't work, start with Settings › **Readiness check**. A game's
 - On-screen controls with a layout editor, gamepad support, frame-rate cap, resolution (1080p or native), performance
   overlay, Turnip driver downloads, save backups, and pack export / import (one .zip). Saves and packs live in the app's storage (uninstalling asks
   whether to keep them); backups go to `Switch2/save-backups/<title ID>`. Saves from 0.1.0 are copied in once.
+- **Updates in the app** (from v0.1.4): when a newer release is out, the app offers it at start (Update or Later), downloads it from this page's release and installs it after you confirm. Settings › **Updates** › **Check for updates**
+  checks at any time.
 
 ## Known issues
 
-- **Warning, `0400C3F00006E000` is a work in progress** and shows black pixels: after a race, going back to the
+- **Warning, Mario Kart World (`0400C3F00006E000`) is a work in progress** and shows black pixels: after a race, going back to the
   character selection screen can turn the 3D scene dark or black (the menus and the race HUD still draw). Free roam
   alone is not affected. Being fixed.
-- `040074A01BF12000`: some texture glitches during fights in some caves.
-- `040074A01BF12000` runs at 30 fps on both drivers: the CPU's work per frame holds it there. 60 fps is a later task.
-- `0400C3F00006E000` has more problems: trees flicker, ground textures are sometimes missing, and memory is tight on
+- Donkey Kong Bananza (`040074A01BF12000`): some texture glitches during fights in some caves.
+- Donkey Kong Bananza (`040074A01BF12000`) runs at 30 fps on both drivers: the CPU's work per frame holds it there. 60 fps is a later task.
+- Pokémon Pokopia (`0400A3A01EE4C000`): the sky is black.
+- Mario Kart World (`0400C3F00006E000`) has more problems: trees flicker, ground textures are sometimes missing, and memory is tight on
   16 GB. It heats the phone a lot.
 - The first visit to an area stutters while its shaders and pipelines are built; later visits are smoother.
 - Phones get hot, and the frame rate drops when they throttle. Crashes happen.
@@ -141,7 +145,8 @@ Videos are welcome. To make yours useful to viewers:
 - Turn on the performance overlay so the frame rate is visible, and say whether frame generation is on.
 - Mention the [known issues](#known-issues) you run into, so viewers know which ones are already being fixed.
 - Link this page for downloads: releases are only published here, and copies elsewhere may be modified.
-- Please don't show or link game dumps, keys or firmware.
+- Please don't show or link game dumps, keys or firmware. The same goes for Issues and Discussions: posts that share, offer
+  or ask for game files, keys or links are edited or removed ([rules](https://github.com/moceure/BananaNative/discussions/23)).
 
 Post your video or your "it runs on my phone" report in
 [Discussions](https://github.com/moceure/BananaNative/discussions): every phone other than the tested one helps, and
@@ -149,15 +154,21 @@ good videos get linked here.
 
 ## History
 
-- **v0.1.0, 4 November 2026**: first public release, with `040074A01BF12000` playable and `0400C3F00006E000` in
+- **v0.1.0, 4 November 2026**: first public release, with Donkey Kong Bananza (`040074A01BF12000`) playable and Mario Kart World (`0400C3F00006E000`) in
   progress.
 - **v0.1.1, 5 November 2026**: `.nup` files, emulator frontend launch, incremental shader updates (v0.1.0 packs are
-  taken over without a rebuild), phone Prepare and about 1 GiB less RAM for `0400C3F00006E000`, RAM in the in-game stats, fewer stutters and less memory
+  taken over without a rebuild), phone Prepare and about 1 GiB less RAM for Mario Kart World (`0400C3F00006E000`), RAM in the in-game stats, fewer stutters and less memory
   for large memory pools and large `.nup` files, saves and packs in the app's storage with pack export / import.
 - **v0.1.2, 5 November 2026**: hotfix for Prepare on shared storage, driver install, Add game and Turnip GPU clocks;
-  `040074A01BF12000` at Phone 720p by default on Turnip as a stopgap.
-- **v0.1.3, 5 November 2026**: `040074A01BF12000` at 30 fps on Turnip at Phone 1080p (was about 20): faster upscaler
+  Donkey Kong Bananza (`040074A01BF12000`) at Phone 720p by default on Turnip as a stopgap.
+- **v0.1.3, 5 November 2026**: Donkey Kong Bananza (`040074A01BF12000`) at 30 fps on Turnip at Phone 1080p (was about 20): faster upscaler
   shader on Adreno and a GPU clock floor for Turnip; Phone 1080p and dynamic resolution are the defaults again.
+- **v0.1.4, 5 November 2026**: in-app updates (a popup at start when a new release is out; Settings › Check for
+  updates), Prepare's code step in a fifth of the memory (fixes Mario Kart World (`0400C3F00006E000`) stopping at rewriting the game code,
+  #20), no false "Pack from other tools" chip.
+- **v0.1.5, 5 November 2026**: Pokémon Pokopia (`0400A3A01EE4C000`) playable at about 60 fps on the system driver and Turnip, with
+  Game resolution working for it (thanks to [Raphix91](https://github.com/Raphix91), #28 #29 #30); a text box for games
+  that ask you to type; shaders already on the phone carry over without an update.
 
 ## License and credits
 
