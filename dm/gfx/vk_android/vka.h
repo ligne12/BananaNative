@@ -118,6 +118,7 @@ VkResult vka_submit(VkCommandBuffer cb, uint64_t signal, uint32_t nwait, const V
 // The fence ledger: fence n is "done" once the GPU passed it and its CPU-side effects (events, counters) have run
 uint64_t vka_fence_next(void);                      // reserve the next fence value (submit thread)
 uint64_t vka_fence_last(void);                      // the last fence reserved (its submission may still be recording on another thread)
+double vka_gpu_tick_ns(void);                       // a GPU timestamp tick in ns: measured against the CPU clock once known (vka_exec.c ts_calibrate), else the driver's timestampPeriod
 uint64_t vka_fence_queued(void);                    // the last fence handed to the queue: the most a submission (the present's) may name, its work being earlier on the queue
 // The replay (vka_exec.c), entered by the replay worker (vka_worker.c) or inline by the mtl_* calls of the submitting thread
 void vka_rp_sub_begin(void);

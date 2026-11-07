@@ -196,12 +196,30 @@ static void gpu_tag_begin(uint64_t f) {
     if (atomic_load(&g_gpu[k].frame) != f) { atomic_store(&g_gpu[k].frame, f); atomic_store(&g_gpu[k].ns, 0); atomic_store(&g_gpu[k].pending, 0); atomic_store(&g_gpu[k].t0, UINT64_MAX); atomic_store(&g_gpu[k].t1, 0); atomic_store(&g_gpu[k].span, 0); }
     atomic_fetch_add(&g_gpu[k].pending, 1);
 }
+// The tick's length measured instead of taken from timestampPeriod, which can be wrong: Mr. Purple's Turnip T30 on the AYN Thor says 33.11 ns where its counter ticks at
+// 19.2 MHz (52.08 ns), so every GPU time read 1.57 times short (Ocarina of Time: "GPU 20 ms" in 32 ms frames with the GPU never idle). A submission's last timestamp is
+// paired with the CPU time the completion thread's blocked wait for its fence returned (vka_fence_wake_ns); two pairs at least 4 s apart give the length, once
+uint64_t vka_fence_wake_ns(uint64_t f);   // vka_dev.c
+static void ts_calibrate(uint64_t fence, uint64_t tick) {
+    static uint64_t c0, k0; static int done;
+    uint64_t c = done ? 0 : vka_fence_wake_ns(fence);
+    if (!c || !tick) return;
+    if (!c0 || tick <= k0 || c <= c0) { c0 = c; k0 = tick; return; }
+    if (c - c0 < 4000000000ull) return;
+    double p = (double)(c - c0) / (double)(tick - k0), d = V.props.limits.timestampPeriod;
+    done = 1;
+    if (p < d / 4 || p > d * 4) { VRED("GPU time: a tick measured at %.2f ns, the driver says %.2f: the driver's kept", p, d); return; }
+    g_ts_ns = p; if (g_sq_ns) g_sq_ns = p;
+    VLOG("GPU time: a tick measured at %.2f ns against the CPU clock (the driver says %.2f ns: GPU times were %.2f times %s before)", p, d, p > d ? p / d : d / p, p > d ? "short" : "long");
+}
+double vka_gpu_tick_ns(void) { return g_ts_ok > 0 ? g_ts_ns : V.props.limits.timestampPeriod; }   // (vka_gprof.c)
 static void gpu_slot_done(unsigned slot) {   // the slot's fence is done: its two timestamps are there
     if (!g_slot_ts[slot]) return;
     g_slot_ts[slot] = 0;
     uint32_t np = g_slot_parts[slot] ? g_slot_parts[slot] : 1; if (np > NCHUNK + 1) np = NCHUNK + 1;
     uint64_t f = g_slot_frame[slot], t[QPS]; unsigned k = f % GRING;
     int ok = !qf.get(V.dev, g_qp, slot * QPS, 2 * np, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT);
+    if (ok && t[2 * np - 1] > t[0]) ts_calibrate(g_slot[slot].fence, t[2 * np - 1]);
     if (atomic_load(&g_gpu[k].frame) != f) return;
     if (ok && t[2 * np - 1] > t[0]) {
         // Busy: each part from its top (or the previous part's bottom, when the part's top was written while the previous part still ran) to its bottom

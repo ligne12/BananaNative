@@ -242,6 +242,14 @@ int vka_ok(void) { return __atomic_load_n(&g_state, __ATOMIC_ACQUIRE) > 0; }
 // needs no wait for an earlier one: its first barrier's scope holds every command earlier in submission order, and so does a fence's signal
 enum { GF_RING = 64 };   // more than NSLOT (vka_exec.c): a value GF_RING back is done before a replay command buffer is recorded again, so its fence is free
 static struct { uint64_t val; VkFence f; } g_gf[GF_RING];   // val: the fence value whose submission this fence signals (written under V.qmu, read after vka_fence_post)
+// When the completion thread's wait for a fence returned, for a wait that blocked (the GPU finished during it): the CPU side of the GPU clock's calibration (vka_exec.c ts_calibrate)
+static _Atomic uint64_t g_wake_ns[GF_RING], g_wake_f[GF_RING];
+uint64_t vka_fence_wake_ns(uint64_t f) {
+    unsigned k = (unsigned)(f % GF_RING);
+    if (atomic_load_explicit(&g_wake_f[k], memory_order_acquire) != f) return 0;
+    uint64_t t = atomic_load_explicit(&g_wake_ns[k], memory_order_relaxed);
+    return atomic_load_explicit(&g_wake_f[k], memory_order_acquire) == f ? t : 0;
+}
 VkResult vka_submit(VkCommandBuffer cb, uint64_t signal, uint32_t nwait, const VkSemaphore *wait, const uint64_t *wait_vals, const VkPipelineStageFlags *stages, VkSemaphore bin_signal) {
     VkSemaphore sig[1]; uint64_t sv[1]; uint32_t ns = 0;
     if (bin_signal) { sig[ns] = bin_signal; sv[ns++] = 0; }
@@ -360,7 +368,11 @@ static void *completion_main(void *arg) {
         uint64_t want = 0, v = sub;
         for (uint64_t f = done + 1; f <= sub; f++) if (g_gf[f % GF_RING].val == f) { want = f; if (!last) break; }
         if (want && !vka_hung()) {
+            uint64_t w0 = now_ns();
             VkResult r = vk.vkWaitForFences(V.dev, 1, &g_gf[want % GF_RING].f, VK_TRUE, 500000000ull);
+            uint64_t w1 = now_ns();
+            if (!r && w1 - w0 > 100000) { unsigned k = (unsigned)(want % GF_RING); atomic_store_explicit(&g_wake_f[k], 0, memory_order_relaxed);
+                                          atomic_store_explicit(&g_wake_ns[k], w1, memory_order_relaxed); atomic_store_explicit(&g_wake_f[k], want, memory_order_release); }
             v = r ? done : want;
             while (!r && v < sub && g_gf[(v + 1) % GF_RING].val != v + 1) v++;
             uint64_t t = now_ns();

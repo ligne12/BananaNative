@@ -13,7 +13,7 @@ enum { NQ = 2048, DESC = 96, NK = 10 };
 typedef struct { uint64_t vs, fs, draws, verts; } gp_key;   // a shader pair of the step's draws
 typedef struct { const char *file; int line; int kind; uint64_t draws, passes, ops; char desc[DESC]; gp_key k[NK]; int nk, more; } gp_mark;   // kind: 0 barrier, 1 submission start, 2 part start, 3 commit
 static gp_mark g_m[NQ]; static int g_n;
-static VkQueryPool g_qp; static int g_ok = -1; static double g_tick_ns;
+static VkQueryPool g_qp; static int g_ok = -1;
 static PFN_vkCmdWriteTimestamp g_write; static PFN_vkCmdResetQueryPool g_reset; static PFN_vkGetQueryPoolResults g_get;
 static int g_state;                     // 0 idle, 1 recording the profiled frame, 2 waiting for its last fence
 static uint64_t g_frame, g_last_frame, g_fence; static VkCommandBuffer g_cb;
@@ -31,7 +31,7 @@ static int init(void) {
     PFN_vkCreateQueryPool create = (PFN_vkCreateQueryPool)vk.vkGetDeviceProcAddr(V.dev, "vkCreateQueryPool");
     VkQueryPoolCreateInfo ci = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = NQ};
     if (!g_write || !g_reset || !g_get || !create || create(V.dev, &ci, NULL, &g_qp) || V.props.limits.timestampPeriod <= 0) { VRED("gpu prof: no timestamp query pool"); return 0; }
-    g_tick_ns = V.props.limits.timestampPeriod; g_ok = 1;
+    g_ok = 1;
     return 1;
 }
 static void mark(VkCommandBuffer cb, int kind, const char *file, int line) {
@@ -62,7 +62,7 @@ static void report(void) {
     static step s[NQ]; int ns = 0; double tot = 0, pass = 0, xfer = 0, bare = 0, first = 0; int npass = 0;
     for (int i = 1; i < g_n; i++) {
         if (g_m[i].kind == 1 || g_m[i].kind == 2) continue;   // the gap before a submission or part: the GPU waited for recording
-        double ms = t[i] > t[i - 1] ? (t[i] - t[i - 1]) * g_tick_ns / 1e6 : 0;
+        double ms = t[i] > t[i - 1] ? (t[i] - t[i - 1]) * vka_gpu_tick_ns() / 1e6 : 0;   // (the tick as measured, vka_exec.c ts_calibrate)
         tot += ms; s[ns++] = (step){i, ms};
         if (g_m[i].passes > g_m[i - 1].passes) { pass += ms; npass++; } else if (g_m[i].ops > g_m[i - 1].ops || g_m[i].draws > g_m[i - 1].draws) xfer += ms; else bare += ms;
         if (g_m[i - 1].kind == 1) first += ms;
