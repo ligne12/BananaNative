@@ -650,7 +650,10 @@ void mtl_present_flush(void) { pthread_mutex_lock(&g_pmu); uint64_t h = g_pq_in;
 // the acquire returns, the present of that image has been handed to the queue (mtl_present_wait of its ticket), its copy waiting for that fence; the game's later
 // submissions come after it on the one queue and begin with a full barrier, so they cannot write the image before the copy has read it. Waiting for every commit made the
 // game wait for its own last frame at each acquire: Donkey Kong Bananza's level blocked ~64 ms a frame in SyncWait, recording (~45 ms) and GPU (~30 ms) one after the other
-uint64_t mtl_acquire_fence(uint64_t presented) { return presented; }
+// DM_VK_ACQUIRE_ALL=1 (live): every commit before the acquire, as the Metal layer has it. The game may then not write a frame's data while the GPU still runs the frame
+// before: Ocarina of Time's shadows changed for one frame in about one of twenty on the AYN Thor (56 ms GPU frames), its CPU rewriting what the frame in flight read
+uint64_t mtl_last_fence(void);
+uint64_t mtl_acquire_fence(uint64_t presented) { return VKA_ENV("DM_VK_ACQUIRE_ALL", 0) ? mtl_last_fence() : presented; }
 double mtl_presented_time(uint64_t n) { return g_pres[n % PRING].n == n ? g_pres[n % PRING].t : 0; }
 int mtl_has_window(void) { return g_surf != VK_NULL_HANDLE; }
 int mtl_display_hz(void) { return !g_surf ? 0 : g_refresh_ns ? (int)(1e9 / g_refresh_ns + 0.5) : 60; }

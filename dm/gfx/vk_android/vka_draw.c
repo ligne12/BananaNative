@@ -1295,6 +1295,9 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
         if (!resolve(mp, 6, &sh[6], &bad) || !resolve(mp, 7, &sh[7], &bad) || !resolve(d->bst[1], 1, &sh[1], &bad)) SKIP("mesh draw skipped: no shader library");
         if (bad) { g_skipped++; return; }   // a refused or missing shader (logged when it was made)
         if (!sh[7]) SKIP("mesh draw with no mesh shader bound: skipped");
+        // DM_VK_MESH_SKIP=<mesh key>,... (live): the mesh draws of those mesh shaders skipped, emulated or not (a wrong mesh draw found by taking draws away)
+        { const char *sk = getenv("DM_VK_MESH_SKIP"); char hex[17]; snprintf(hex, sizeof hex, "%016llx", (unsigned long long)sh[7]->key);
+          if (sk && *sk && strstr(sk, hex)) { g_skipped++; return; } }
         if (d->bst[6] && d->bst[6] != mp) VRED_ONCE("mesh draw: a program bound at the task stage bit apart from the mesh program; drawn with the mesh program's own task shader, if any");
         // A pixel shader with per-primitive inputs reads what its mesh shader writes per primitive (Vulkan matches only equally decorated interfaces). The other way round
         // (a mesh shader with per-primitive outputs, a pixel shader without the decoration: vk_android_build.py leaves a pixel shader also drawn with vertex shaders per
