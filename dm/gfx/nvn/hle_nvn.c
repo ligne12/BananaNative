@@ -2285,6 +2285,9 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         if (g_tsv && mtl_link_tick(n, &lt, &ll, &lk, &lg)) { trow(f - 8, "@link_target_ms", lt * 1e3 - g_t0_ns / 1e6); trow(f - 8, "@link_lead_ms", ll); trow(f - 8, "@link_ticks", lk); trow(f - 8, "@link_gap_ms", lg); } }
     if (f >= 8 && slow_on()) slow_emit(f - 8);
     prev_out = now_ns();
+    // DM_VK_PRESENT_WAIT=1 (diagnostic, live): the present returns once the GPU has done every commit before it, so the game never writes a frame's data while the GPU
+    // runs the one before (CPU and GPU take turns: slower). To tell a race on data the game shares with the GPU from a fault of the replay
+    { const char *pw = getenv("DM_VK_PRESENT_WAIT"); if (pw && atoi(pw)) mtl_wait(mtl_last_fence(), 2000000000ull); }
 }
 
 // ---------- State-only interfaces used by newer-SDK games (SMBW): buffer objects, pool / sampler / texture queries, views, color state, device and window ----------
