@@ -1264,6 +1264,14 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Found on:** [Pokémon Legends: Z-A](../../dm/games/0100F43008C44000/README.md#rendering) ([PR #178](https://github.com/seedds/nxnative/pull/178)); [SHIN MEGAMI TENSEI V: Vengeance](../../dm/games/010069C01AB82000/README.md), whose two buffer-image counter shaders dispatched at boot consume their returned values.
 - **Check:** `dm/tools/tests/test_image_atomic_bounds.py`. Portable tests check the MSL version choice and the rejection of the pointer form. With `DMSH_TEST_XLATE` set to a rebuilt translator (and `spirv-val` on `PATH`; spirv-cross is the in-repo build) the synthetic shaders are translated, the guard's dataflow is checked in the SPIR-V (the size query and comparison dominate the atomic, the phi carries zero on the invalid edge), and the MSL is produced; `DMSH_TEST_METAL=1` compiles and links it (`DMSH_TEST_METAL_SDKS=macosx,iphoneos` for both SDKs) and `DMSH_TEST_GPU=1` runs the returning fixtures (above). Changing this path changes the chain version: rebuild the translator and update the lock before building shaders.
 
+### ATOMG.CAS and multisample fetches with offsets
+
+- **Symptom:** `Ampere instruction 3a9 at 0x… is not implemented` in the shader build: the shader is left out and its dispatches skipped.
+- **Cause:** ATOMG.CAS (0x3a9), the compare-and-swap on global memory, was not decoded. Its destination is the old value, unlike ATOMS.CAS's success flag: Ocarina of Time's `3b8ecb1aa4207240` sets R30 = 0xff, swaps with `CAS [R38.64], R30, R31` and compares R30 with 0xff right after. The address is the register form of ATOMG's (bit 72 a register pair, offset 40..63), the new value is the register at 64..71. Found with it, by reading the code: a multisample TEX / TLD appended its sample index after the texel offsets, while the SPIR-V generator and `TexturePass.InsertConstOffsets` read it where an explicit LOD goes, before them, so a multisample fetch with AOFFI took offset x as its sample.
+- **Fix:** general: `InstEmitAmpereMem.cs` `AAtomgCas` (32-bit, register address; any other form stops the shader with its own message) as an `AtomicCompareAndSwap` on global memory, which the global-to-storage pass turns into a storage buffer or memory pool table compare-exchange. The sample index now goes before the offsets. The finding of Swap2-Native, written anew.
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md#found-on-this-game): its six `FoliageShader.sharcb` compute shaders, the only users of 0x3a9 in the five Switch 2 games on hand. No multisample fetch with offsets is known on a game.
+- **Check:** `test_dmsh_ampere_mem.py` `AtomgCas` (`DMSH_TEST_XLATE`).
+
 ## Shaders compiled at run time
 
 ### A GLSL language preamble is not a complete shader

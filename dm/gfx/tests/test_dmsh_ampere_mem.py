@@ -37,6 +37,45 @@ class Translated(unittest.TestCase):
             return r.stdout
 
 
+class GuardedWrites(Translated):
+    P0 = (0x000fda0003f06070, 0x00c0060005007a0c)   # P0 = R5 >= c3[0x18], R5 an instruction's own
+    MOV_R5 = (0x000fe20000000f00, 0x0100000000057a02)   # R5 = c4[0]
+
+    def test_a_guarded_load_reads_its_address_before_the_false_guards_zero(self):
+        # UR4 = c3[0x10]; LDG.!P0 R5, [R5 + UR4], Unreal Engine 5.4's bounds-checked read of its scene data: zeroing R5 first read at the table's start, every instance with the first one's data
+        ur4, ldg = (0x000fe20000000a00, 0x00c0040000047ab9), (0x000ea200081e890f, 0x0000000405057981)
+        waits = (0x004ea200001ee000, 0x00000c05050c7593)   # waits for the load's barrier, then atomically adds its result at the address it read: both uses of it
+        msl = self.translate(inst(*self.MOV_R5) + inst(*ur4) + inst(*self.P0) + inst(*ldg) + inst(*waits) + inst(*EXIT))
+        self.assertNotIn('_m0[0]);', msl.split('kernel')[1].replace('_m0[0].x', ''))   # no read of the table's first word
+        self.assertRegex(msl, r'_m0\[(int\()?\w+')   # an index from the register
+
+    def test_a_deferred_write_under_a_false_guard_writes_nothing(self):
+        # MUFU.EX2 R17, R32 under P0 (write barrier 3); R17 = R29 * R29 under !P0; R17 = R36 * R17 after waiting on the barrier: Yoshi and the Mysterious Book's local lights' falloff. The wait copied
+        # the old R17 over !P0's value, whatever the guard had been
+        ex2, other, used = (0x000ee20000000800, 0x0000002000170308), (0x000fe20000410000, 0x0000001d1d178220), (0x008fe20000410000, 0x0000001724177220)
+        msl = self.translate(inst(*self.MOV_R5) + inst(*self.P0) + inst(*ex2) + inst(*other) + inst(*used) + inst(SUATOM[0], 0x00000c17030c7593) + inst(*EXIT))
+        self.assertRegex(msl, r'\? 1065353216 : 0;')   # the guard as it was at issue, a word that keeps its bits through a select
+        self.assertRegex(msl, r'bool \w+ = \w+ != 0;\s+float \w+ = \w+;\s+if \(\w+\)')   # the copy only where it held
+
+
+class AtomgCas(Translated):
+    # ATOMG.CAS R30, [R38.64], R30 (compare), R31 (new value), 0x3a9, as Zelda: Ocarina of Time's foliage compute 3b8ecb1aa4207240 encodes it at 0x8ae0; then SUATOM.ADD
+    # of R30, so the CAS's result (the old value, which the game compares with the comparand) has a use
+    CAS = (0x000ea400001ee11f, 0x0000001e261e73a9)
+    USE = (0x004ea200001ee000, 0x00000c1e031e7593)
+
+    def test_cas_returns_the_old_value(self):
+        msl = self.translate(inst(*self.CAS) + inst(*self.USE) + inst(*EXIT), ssbo_align=64, subgroup_size=64, gs_passthrough=False)
+        self.assertIn('atomic_compare_exchange', msl)   # through the memory pool table (no storage buffer traced)
+        call = re.search(r'int (_\d+) = (_\d+)\(_\d+, _\d+, _\d+, _\d+, ', msl)
+        self.assertTrue(call, msl)   # the helper takes the address pair, the comparand and the value
+        self.assertRegex(msl, r'int \w+ = ' + call.group(1) + r';[\s\S]*atomic_fetch_add')   # its result is what the next instruction reads
+
+    def test_refused_64_bit(self):
+        with self.assertRaises(AssertionError):
+            self.translate(inst(self.CAS[0] | 1 << 9, self.CAS[1]) + inst(*EXIT))
+
+
 class Suatom(Translated):
     def test_add_u32_on_a_1d_image(self):
         msl = self.translate(inst(*SUATOM) + inst(*EXIT))
