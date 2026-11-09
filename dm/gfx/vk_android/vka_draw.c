@@ -814,7 +814,7 @@ static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const
             int storage = r[i].desc == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             switch (r[i].what) {
             case VKA_R_BUF: ok = storage ? ssbo_desc(r[i].addr, r[i].size, bi, !(r[i].flags & DMSH_VK_BF_RW)) : ubo_desc(r[i].addr, r[i].size, bi);
-                if (ok && storage && (r[i].flags & DMSH_VK_BF_RW)) vka_tex_gw_opaque(r[i].addr, bi->range);   // the shader may store into it
+                if (ok && storage && (r[i].flags & DMSH_VK_BF_RW)) { vka_tex_gw_opaque(r[i].addr, bi->range); vka_gww_add(r[i].addr, bi->range, sh->key, st); }   // the shader may store into it
                 break;
             case VKA_R_C1: if (sh->c1_len) *bi = (VkDescriptorBufferInfo){sh->c1.buf, sh->c1.off, (sh->c1_len + 15) & ~(VkDeviceSize)15}; else ok = 0; break;
             case VKA_R_SUPPORT:

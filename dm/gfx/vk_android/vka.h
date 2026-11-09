@@ -437,6 +437,8 @@ void vka_tex_gw_fill(uint64_t dst, uint64_t n, uint32_t value);
 void vka_tex_gw_update(uint64_t dst, uint64_t n, const void *data);
 void vka_tex_gw_opaque(uint64_t dst, uint64_t n);   // bytes the host does not know at recording (shader stores, texture → buffer copies)
 int vka_tex_gw_pending(uint64_t lo, uint64_t hi);   // 1: a GPU write into [lo, hi) recorded and not known done
+void vka_gww_add(uint64_t lo, uint64_t n, uint64_t key, int st);   // DM_VK_GPU_WRITE_WATCH (vka_gwatch.c): a storage buffer bound for stores
+void vka_gww_commit(uint64_t fence);
 int vka_tex_gml_take(VkDescriptorBufferInfo *bi);  // a raw global memory write log for one draw or dispatch, read when its submission is done (0 = none free)
 void vka_tex_gw_commit(uint64_t fence);
 void vka_tex_watch_dispatch(uint64_t key);         // DM_VK_NANSCAN: compute shaders by submission, for the storage watch             // the writes recorded since the last commit belong to this submission

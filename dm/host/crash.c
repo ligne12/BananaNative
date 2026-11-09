@@ -99,6 +99,12 @@ void dm_backtrace(uint64_t fp) {
 static int (*g_fault_hook[MAX_FAULT_HOOK])(void *addr, int is_write, void *uc);
 static void (*g_write_prep[MAX_FAULT_HOOK])(void *addr, size_t len);
 static int g_nfault_hook, g_nwrite_prep;
+// Observers see each fault first and handle nothing (vka_gwatch.c: CPU writes into memory the GPU still uses); same constraints as the hooks
+static void (*g_fault_obs[MAX_FAULT_HOOK])(void *addr, int is_write, void *uc); static int g_nfault_obs;
+void dm_fault_observer_register(void (*fn)(void *addr, int is_write, void *uc)) {
+    if (g_nfault_obs >= MAX_FAULT_HOOK) die("too many page fault observers");
+    g_fault_obs[g_nfault_obs++] = fn;
+}
 void dm_fault_hook_register(int (*fn)(void *addr, int is_write, void *uc)) {
     if (g_nfault_hook >= MAX_FAULT_HOOK) die("too many page fault hooks");
     g_fault_hook[g_nfault_hook++] = fn;
@@ -137,6 +143,7 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
     if (sig == SIGTRAP && g_trap_hook && g_trap_hook(uc)) return;
     if (sig == SIGSEGV || sig == SIGBUS) {
         int is_write = (int)((PLAT_UC_ESR(uc) >> 6) & 1);   // The WnR bit of ESR
+        for (int i = 0; i < g_nfault_obs; i++) g_fault_obs[i](si->si_addr, is_write, uc);
         for (int i = 0; i < g_nfault_hook; i++) if (g_fault_hook[i](si->si_addr, is_write, uc)) return;
     }
     crash_gate(sig);

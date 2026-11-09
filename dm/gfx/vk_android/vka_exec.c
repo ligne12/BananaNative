@@ -377,7 +377,7 @@ uint64_t vka_rp_sub_commit(uint64_t reserved) {
     VkResult r = vk.vkEndCommandBuffer(g_cb);
     g_rec_ns += now_ns() - g_sub_t0;
     g_hrec[fence % NHREC] = (typeof(g_hrec[0])){fence, g_frame, S.serial, g_stat_draws - g_sub_draws0, g_stat_ops - g_sub_ops0, g_stat_skipped - g_sub_skip0, now_ns() - g_sub_t0};
-    vka_tex_gw_commit(fence);
+    vka_tex_gw_commit(fence); vka_gww_commit(fence);
     vka_floor_commit(tail);
     vka_up_flush(); vka_up_throttle();   // before the submission that may use what it made
     if (!r) r = vka_submit(g_cb, fence, 0, NULL, NULL, NULL, VK_NULL_HANDLE);
