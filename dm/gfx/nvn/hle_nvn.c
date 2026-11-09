@@ -2286,8 +2286,16 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     if (f >= 8 && slow_on()) slow_emit(f - 8);
     prev_out = now_ns();
     // DM_VK_PRESENT_WAIT=1 (diagnostic, live): the present returns once the GPU has done every commit before it, so the game never writes a frame's data while the GPU
-    // runs the one before (CPU and GPU take turns: slower). To tell a race on data the game shares with the GPU from a fault of the replay
-    { const char *pw = getenv("DM_VK_PRESENT_WAIT"); if (pw && atoi(pw)) mtl_wait(mtl_last_fence(), 2000000000ull); }
+    // runs the one before (CPU and GPU take turns: slower). To tell a race on data the game shares with the GPU from a fault of the replay. =n (n >= 2): once the GPU has
+    // done this frame's (n - 1)th commit only (its first commits hold the frame's GPU culling): the CPU's next frame waits for them, the GPU keeps the rest of the frame
+    {
+        static uint64_t prev_last; static int logged; uint64_t last = mtl_last_fence();
+        const char *pw = getenv("DM_VK_PRESENT_WAIT"); int n = pw ? atoi(pw) : 0;
+        if (n == 1) mtl_wait(last, 2000000000ull);
+        else if (n >= 2 && prev_last) { uint64_t want = prev_last + (uint64_t)(n - 1); mtl_wait(want < last ? want : last, 2000000000ull); }
+        if (n >= 2 && logged < 4 && prev_last) { logged++; LOG("[nvn] DM_VK_PRESENT_WAIT=%d: this frame made %llu commits (fences %llu-%llu)", n, (unsigned long long)(last - prev_last), (unsigned long long)prev_last + 1, (unsigned long long)last); }
+        prev_last = last;
+    }
 }
 
 // ---------- State-only interfaces used by newer-SDK games (SMBW): buffer objects, pool / sampler / texture queries, views, color state, device and window ----------

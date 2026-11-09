@@ -480,19 +480,50 @@ static int cpu_read(uint64_t addr, void *out, size_t n) {   // guest bytes as th
     return !plat_mem_read(addr, out, n);
 }
 static int rd_cb(void *ctx, uint64_t addr, void *out, size_t n) { (void)ctx; return cpu_read(addr, out, n); }
-// A uniform buffer: bound in place when Vulkan's offset alignment allows, else a copy of what the CPU sees now (a GPU write earlier in this submission is missed: logged)
+// DM_VK_UB_SNAP=1 (live): a game uniform buffer is bound as a copy of the bytes the CPU sees when its draw or dispatch is recorded, not in place in guest memory, unless a
+// GPU write into it is still pending (an inline update, a copy or a shader store recorded earlier and not done: bound in place, as before). In place, the GPU reads the buffer
+// when it runs, and a game that rewrites its constants for the next frame once it has submitted (the Switch's GPU is done with the frame by then) has the frame in flight read
+// the next frame's: Ocarina of Time's foliage culling on the AYN Thor (56 ms GPU frames) dropped foliage and its shadows for one frame in about one of six (DM_VK_PRESENT_WAIT
+// cured it at 4 ms a frame). One copy per buffer (address and size) per submission: the memo goes with the submission's scratch spans (drv_memo_reset)
+enum { UBM = 4096 };
+static struct { uint64_t addr, size, gen; vka_span s; int inplace; } g_ubm[UBM];
+static uint64_t g_ubm_gen = 1, g_ub_snaps, g_ub_snap_bytes, g_ub_snap_kept, g_ub_snap_memo; static int g_ub_snap;
+static int ub_snap(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *bi) {   // 0: bind in place
+    uint64_t h = (addr >> 4) * 0x9e3779b97f4a7c15ull ^ size; int slot = -1;   // (a storage buffer's size carries bit 62: a key of its own, its alignment)
+    for (int k = 0; k < 8; k++) {
+        int i = (int)((h + (uint64_t)k) % UBM);
+        if (g_ubm[i].gen != g_ubm_gen) { slot = i; break; }
+        if (g_ubm[i].addr == addr && g_ubm[i].size == size) {
+            if (g_ubm[i].inplace) return 0;
+            g_ub_snap_memo++; *bi = (VkDescriptorBufferInfo){g_ubm[i].s.buf, g_ubm[i].s.off, size & ~(1ull << 62)}; return 1;
+        }
+    }
+    uint64_t key = size, n = size & ~(1ull << 62);
+    if (vka_tex_gw_pending(addr, addr + n)) { g_ub_snap_kept++; if (slot >= 0) g_ubm[slot] = (typeof(g_ubm[0])){addr, key, g_ubm_gen, {0}, 1}; return 0; }
+    vka_span s; if (!vka_scratch(n, key != n ? V.sb_align : V.ub_align, &s)) return 0;
+    memcpy(s.ptr, (const void *)(uintptr_t)addr, n);
+    if (slot >= 0) g_ubm[slot] = (typeof(g_ubm[0])){addr, key, g_ubm_gen, s, 0};
+    g_ub_snaps++; g_ub_snap_bytes += n;
+    *bi = (VkDescriptorBufferInfo){s.buf, s.off, n}; return 1;
+}
+// A uniform buffer: bound in place when Vulkan's offset alignment allows (or a copy, DM_VK_UB_SNAP), else a copy of what the CPU sees now (a GPU write earlier in this
+// submission is missed: logged)
 static int ubo_desc(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *bi) {
     if (!size || size > V.ub_range) size = size ? V.ub_range : 65536 < V.ub_range ? 65536 : V.ub_range;
     VkBuffer b; VkDeviceSize o;
     uint64_t run = vka_addr_run(addr, size, &b, &o);
-    if (run && !(o % V.ub_align) && !(addr % V.ub_align)) { *bi = (VkDescriptorBufferInfo){b, o, run}; return 1; }
+    if (run && !(o % V.ub_align) && !(addr % V.ub_align)) {
+        if (g_ub_snap && run >= size && ub_snap(addr, size, bi)) return 1;
+        *bi = (VkDescriptorBufferInfo){b, o, run}; return 1;
+    }
     vka_span s; if (!vka_scratch(size, V.ub_align, &s)) return 0;
     if (!cpu_read(addr, s.ptr, size)) { memset(s.ptr, 0, size); VRED_ONCE("uniform buffer at %#llx is not readable: it reads zeros", (unsigned long long)addr); }
     else if (run) VRED_ONCE("uniform buffer at %#llx is not %llu-byte aligned: bound as a copy of the CPU's bytes", (unsigned long long)addr, (unsigned long long)V.ub_align);
     else VRED_ONCE("uniform buffer at %#llx is not in placed guest RAM: bound as a copy of the CPU's bytes", (unsigned long long)addr);
     *bi = (VkDescriptorBufferInfo){s.buf, s.off, size}; return 1;
 }
-static int ssbo_desc(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *bi) {
+static int ssbo_desc(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *bi, int ro) {
+    (void)ro;   // (copying read-only storage buffers too, as DM_VK_UB_SNAP does uniform buffers, lost Ocarina of Time's foliage: some are written by the GPU where the write tracking does not see it)
     VkBuffer b; VkDeviceSize o;
     uint64_t run = vka_addr_run(addr, size ? size : V.sb_range, &b, &o);
     if (!run) { VRED_ONCE("storage buffer at %#llx is not in placed guest RAM: it is not bound", (unsigned long long)addr); return 0; }
@@ -508,7 +539,14 @@ typedef struct { VkBuffer buf; VkDeviceSize off; } c0_at;
 static struct { int valid; vka_span s; uint8_t b[DMSH_DRV_SIZE]; } g_dm[VKA_NSTAGE][3];
 static struct { int valid; uint32_t ref; vka_span s; } g_sm_ref;   // the support buffer with the alpha test's reference (stage_writes)
 static int g_drv_memo = 1; static uint64_t g_dm_hit, g_dm_miss;
-static void drv_memo_reset(void) { for (int st = 0; st < VKA_NSTAGE; st++) for (int b = 0; b < 3; b++) g_dm[st][b].valid = 0; g_sm_ref.valid = 0; g_drv_memo = VKA_ENV("DM_VK_DRV_MEMO", 1); }
+static void drv_memo_reset(void) {
+    for (int st = 0; st < VKA_NSTAGE; st++) for (int b = 0; b < 3; b++) g_dm[st][b].valid = 0;
+    g_sm_ref.valid = 0; g_drv_memo = VKA_ENV("DM_VK_DRV_MEMO", 1);
+    g_ubm_gen++; g_ub_snap = VKA_ENV("DM_VK_UB_SNAP", 0);   // (ubo_desc: the copies go with the last submission's spans)
+    static uint64_t subs; if (g_ub_snap && ++subs % 600 == 0)
+        VLOG("uniform buffer copies (DM_VK_UB_SNAP): %llu made (%.1f MB), %llu reused in their submission, %llu bound in place (a GPU write pending)", (unsigned long long)g_ub_snaps,
+             g_ub_snap_bytes / 1e6, (unsigned long long)g_ub_snap_memo, (unsigned long long)g_ub_snap_kept);
+}
 static int g_kd_cur, g_kd_last; static void kd_file(int draw, const char *what, const void *p, size_t n, int guest);   // DM_VK_KEYDUMP_FULL (below, with the keydump)
 static int drv_seg(const vka_dstate *d, int st, int bank, int pool, VkDescriptorBufferInfo *bi, c0_at *c0) {
     size_t sz = vka_drv_size(bank); vka_span s;
@@ -775,7 +813,7 @@ static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const
         case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER: case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: {
             int storage = r[i].desc == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             switch (r[i].what) {
-            case VKA_R_BUF: ok = storage ? ssbo_desc(r[i].addr, r[i].size, bi) : ubo_desc(r[i].addr, r[i].size, bi);
+            case VKA_R_BUF: ok = storage ? ssbo_desc(r[i].addr, r[i].size, bi, !(r[i].flags & DMSH_VK_BF_RW)) : ubo_desc(r[i].addr, r[i].size, bi);
                 if (ok && storage && (r[i].flags & DMSH_VK_BF_RW)) vka_tex_gw_opaque(r[i].addr, bi->range);   // the shader may store into it
                 break;
             case VKA_R_C1: if (sh->c1_len) *bi = (VkDescriptorBufferInfo){sh->c1.buf, sh->c1.off, (sh->c1_len + 15) & ~(VkDeviceSize)15}; else ok = 0; break;

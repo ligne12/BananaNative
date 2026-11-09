@@ -799,6 +799,13 @@ void vka_tex_gw_copy(uint64_t src, uint64_t dst, uint64_t n) { gw_add(GW_COPY, d
 void vka_tex_gw_fill(uint64_t dst, uint64_t n, uint32_t value) { gw_add(GW_FILL, dst, n, 0, value, NULL); }
 void vka_tex_gw_update(uint64_t dst, uint64_t n, const void *data) { gw_add(GW_UPDATE, dst, n, 0, 0, data); }
 void vka_tex_gw_opaque(uint64_t dst, uint64_t n) { gw_add(GW_OPAQUE, dst, n, 0, 0, NULL); }
+int vka_tex_gw_pending(uint64_t lo, uint64_t hi) {   // a GPU write into [lo, hi) recorded and not known done (this submission's, or one in flight)
+    uint64_t done = vka_done(); int hit = 0;
+    pthread_mutex_lock(&g_tmu);
+    for (int i = g_ngw - 1; i >= 0 && !hit; i--) hit = (!g_gw[i].fence || g_gw[i].fence > done) && g_gw[i].lo < hi && g_gw[i].hi > lo;
+    pthread_mutex_unlock(&g_tmu);
+    return hit;
+}
 // Stores through raw global memory (an address the shader loaded: dmsh_abi.h DMSH_GMEM_LOG_*) land where only the GPU knows: each draw or dispatch with such stores gets a write
 // log of its own, read once its submission is done; its pages become writes of unknown bytes, done (the images over them are uploaded again)
 enum { GML_N = 256, GML_BYTES = (1 + (1 << DMSH_GMEM_LOG_LOG2)) * 4 };
