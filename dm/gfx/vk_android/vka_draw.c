@@ -1350,6 +1350,7 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
         if (memu) {
             if (!VKA_ENV("DM_VK_MESH_EMU", 1)) SKIP("mesh draw: emulation off (DM_VK_MESH_EMU=0): skipped");
             if (!memu_run(d, dw, sh)) { g_skipped++; return; }
+            if (VKA_ENV("DM_VK_MESH_EMU", 1) == 2) { g_memu_on = 0; g_skipped++; return; }   // =2 (diagnostic): the dispatches only, not the draw (the draws' share of the emulation's cost)
             sh[0] = sh[7]; sh[6] = sh[7] = NULL;   // the draw: slot 0 the mesh entry (its DMSH_VK_MOD_MESH_EMU_VS module: VKA_KEY_MESH_EMU), the pixel shader
         }
     } else {

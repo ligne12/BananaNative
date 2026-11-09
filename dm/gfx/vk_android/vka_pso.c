@@ -991,29 +991,38 @@ static void pstats_ir(VkPipeline p, uint32_t e, const char *stage, uint64_t key)
         }
     for (uint32_t i = 0; i < n; i++) free(ir[i].pData);
 }
-static void pstats(vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, const vka_gkey *k) {
+// The DM_VK_PSTATS key among the shaders given, not reported yet (it is then marked reported): its index, else -1
+static int pstats_take(const uint64_t *keys, int n, uint64_t *out) {
     static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; static uint64_t key[8]; static int nk = -1, done[8];
     pthread_mutex_lock(&mu);
     if (nk < 0) { nk = 0; for (const char *e = getenv("DM_VK_PSTATS"); e && *e && nk < 8;) { char *x; uint64_t v = strtoull(e, &x, 16); if (x == e) break; key[nk++] = v; e = *x == ',' ? x + 1 : x; } }
-    int hit = -1; for (int i = 0; i < nk && hit < 0; i++) for (int st = 0; st < VKA_NSTAGE; st++) if (sh[st] && sh[st]->key == key[i] && !done[i]) { hit = i; break; }
-    if (hit >= 0) done[hit] = 1;
+    int hit = -1; for (int i = 0; i < nk && hit < 0; i++) for (int j = 0; j < n; j++) if (keys[j] && keys[j] == key[i] && !done[i]) { hit = i; break; }
+    if (hit >= 0) { done[hit] = 1; *out = key[hit]; }
     pthread_mutex_unlock(&mu);
-    if (hit < 0) return;
+    return hit;
+}
+static VkPipelineCreateFlags pstats_flags(void) { const char *d = getenv("DM_VK_PSTATS_IR"); return VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR | (d && *d ? VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR : 0); }
+static void pstats_report(VkPipeline p, uint64_t key);
+static void pstats(vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, const vka_gkey *k) {
+    uint64_t keys[VKA_NSTAGE], key = 0; for (int st = 0; st < VKA_NSTAGE; st++) keys[st] = sh[st] ? sh[st]->key : 0;
+    if (pstats_take(keys, VKA_NSTAGE, &key) < 0) return;
+    pstate *P = malloc(sizeof *P); VkPipeline p = VK_NULL_HANDLE; VkResult r = VK_ERROR_UNKNOWN;
+    if (P && pstate_fill(P, sh, lay, k)) { P->ci.flags |= pstats_flags(); r = vk.vkCreateGraphicsPipelines(V.dev, VK_NULL_HANDLE, 1, &P->ci, NULL, &p); }
+    free(P);
+    if (r || !p) { VRED("pipeline statistics of %016llx: the copy of its pipeline was not made (%d)", (unsigned long long)key, r); return; }
+    pstats_report(p, key);
+    vk.vkDestroyPipeline(V.dev, p, NULL);
+}
+// Each executable's statistics (and its IR with DM_VK_PSTATS_IR) of a pipeline made with pstats_flags
+static void pstats_report(VkPipeline p, uint64_t key) {
     PFN_vkGetPipelineExecutablePropertiesKHR gp = (PFN_vkGetPipelineExecutablePropertiesKHR)vk.vkGetDeviceProcAddr(V.dev, "vkGetPipelineExecutablePropertiesKHR");
     PFN_vkGetPipelineExecutableStatisticsKHR gs = (PFN_vkGetPipelineExecutableStatisticsKHR)vk.vkGetDeviceProcAddr(V.dev, "vkGetPipelineExecutableStatisticsKHR");
-    pstate *P = malloc(sizeof *P); VkPipeline p = VK_NULL_HANDLE; VkResult r = VK_ERROR_UNKNOWN;
-    const char *irdir = getenv("DM_VK_PSTATS_IR");
-    if (gp && gs && P && pstate_fill(P, sh, lay, k)) {
-        P->ci.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR | (irdir && *irdir ? VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR : 0);
-        r = vk.vkCreateGraphicsPipelines(V.dev, VK_NULL_HANDLE, 1, &P->ci, NULL, &p);
-    }
-    free(P);
-    if (r || !p) { VRED("pipeline statistics of %016llx: the copy of its pipeline was not made (%d)", (unsigned long long)key[hit], r); return; }
+    if (!gp || !gs) return;
     VkPipelineInfoKHR pi = {VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR, .pipeline = p};
     VkPipelineExecutablePropertiesKHR ep[8]; uint32_t ne = 8;
     for (uint32_t i = 0; i < ne; i++) ep[i] = (VkPipelineExecutablePropertiesKHR){VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR};
     VkResult rp = gp(V.dev, &pi, &ne, ep); if (rp < 0) ne = 0;
-    VLOG("pipeline statistics of %016llx: its pipeline copied (%d executables, %d)", (unsigned long long)key[hit], (int)ne, rp);
+    VLOG("pipeline statistics of %016llx: its pipeline copied (%d executables, %d)", (unsigned long long)key, (int)ne, rp);
     for (uint32_t e = 0; e < ne; e++) {
         VkPipelineExecutableStatisticKHR st[48]; uint32_t ns = 48;
         for (uint32_t i = 0; i < ns; i++) st[i] = (VkPipelineExecutableStatisticKHR){VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR};
@@ -1026,10 +1035,9 @@ static void pstats(vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, cons
             else o += (size_t)snprintf(line + o, sizeof line - o, " %s %lld;", st[i].name, st[i].format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR ? (long long)v->b32 :
                                        st[i].format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR ? (long long)v->i64 : (long long)v->u64);
         }
-        VLOG("pipeline statistics of %016llx: %s:%s", (unsigned long long)key[hit], ep[e].name, line);
-        pstats_ir(p, e, ep[e].name, key[hit]);
+        VLOG("pipeline statistics of %016llx: %s:%s", (unsigned long long)key, ep[e].name, line);
+        pstats_ir(p, e, ep[e].name, key);
     }
-    vk.vkDestroyPipeline(V.dev, p, NULL);
 }
 static gval *gfx_obtain(const gkey_full *fk, uint64_t h, size_t len, vka_shader *const sh[VKA_NSTAGE], const vka_layout *lay, const vka_gkey *k, int prewarm, int *made) {
     *made = 0;
@@ -1180,6 +1188,9 @@ static VkPipeline cs_obtain(vka_shader *cs, const vka_layout *lay, int prewarm, 
         r = VK_ERROR_FEATURE_NOT_PRESENT; over = 1;
         static _Atomic int n; if (atomic_fetch_add(&n, 1) < 16) VRED("compute program %016llx takes %u bytes of shared memory, the device at most %u: not made, its dispatches are skipped (the first 16 are logged; the count is in the pipeline line)", (unsigned long long)cs->key, cs->e->shared, smax);
     } else { int bs = build_begin("compute pipeline", cs->key, 0); r = vk.vkCreateComputePipelines(V.dev, g_pc, 1, &ci, NULL, &p); build_end(bs); }
+    { uint64_t k1 = cs->key, kk;   // DM_VK_PSTATS: a compute program's statistics too (an emulated task / mesh program's: its key)
+      if (!r && V.pstats && pstats_take(&k1, 1, &kk) >= 0) { VkComputePipelineCreateInfo c2 = ci; VkPipeline q = VK_NULL_HANDLE; c2.flags |= pstats_flags();
+          if (!vk.vkCreateComputePipelines(V.dev, VK_NULL_HANDLE, 1, &c2, NULL, &q) && q) { pstats_report(q, kk); vk.vkDestroyPipeline(V.dev, q, NULL); } } }
     pthread_mutex_lock(&g_mu);
     if (over) { p = VK_NULL_HANDLE; g_ncs_over++; } else if (r) { p = VK_NULL_HANDLE; g_nfail++; } else { g_ncs++; g_made++; if (!prewarm) g_frame_made++; }
     { uint64_t dns = now_ns() - t0; g_create_ms += dns / 1e6; if (!prewarm) g_create_ns += dns; }
