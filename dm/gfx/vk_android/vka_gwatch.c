@@ -3,8 +3,8 @@
 // seen by a fault observer (crash.c dm_fault_observer_register, ahead of the tracker's handler, which then unprotects the page as for any write): 1 logs it (the address, the
 // buffer, the shader that bound it, the writing instruction, how far behind the GPU is), 2 also makes the writer wait there until that submission is done, as the Switch 2's
 // GPU would long have been; 3 waits for every submission reserved before the write (2 only for the one that bound the buffer: the next frame's had often started,
-// and the game's reset of its exposure sums then landed in it: the whole picture flickered). Ocarina of Time on the AYN Thor (56 ms GPU frames): the game resets counters its culling adds into for the next frame while the GPU still runs
-// the frame before; the foliage and its shadows dropped for one frame in about one of six (DM_VK_PRESENT_WAIT=1, the present waiting for the whole GPU, cured it at 4 ms)
+// and the game's reset of its exposure sums then landed in it: the whole picture flickered). Ocarina of Time on the AYN Thor (56 ms GPU frames) makes about 170 such writes a frame (it resets counters its culling adds into while the GPU
+// still runs the frame before) with nothing to see: the foliage that dropped for one frame, first put down to them, was a translation fault (docs/reference/shaders.md)
 #if defined(__ANDROID__)
 #include "vka.h"
 #include "../nvn/nvn_dirty.h"

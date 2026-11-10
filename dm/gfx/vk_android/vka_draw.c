@@ -483,8 +483,9 @@ static int rd_cb(void *ctx, uint64_t addr, void *out, size_t n) { (void)ctx; ret
 // DM_VK_UB_SNAP=1 (live): a game uniform buffer is bound as a copy of the bytes the CPU sees when its draw or dispatch is recorded, not in place in guest memory, unless a
 // GPU write into it is still pending (an inline update, a copy or a shader store recorded earlier and not done: bound in place, as before). In place, the GPU reads the buffer
 // when it runs, and a game that rewrites its constants for the next frame once it has submitted (the Switch's GPU is done with the frame by then) has the frame in flight read
-// the next frame's: Ocarina of Time's foliage culling on the AYN Thor (56 ms GPU frames) dropped foliage and its shadows for one frame in about one of six (DM_VK_PRESENT_WAIT
-// cured it at 4 ms a frame). One copy per buffer (address and size) per submission: the memo goes with the submission's scratch spans (drv_memo_reset)
+// the next frame's. One copy per buffer (address and size) per submission: the memo goes with the submission's scratch spans (drv_memo_reset). Ocarina of Time's foliage,
+// which dropped for one frame in about six on the AYN Thor and was first put down to this, had a translation fault instead (docs/reference/shaders.md, shuffles through
+// workgroup memory); with this switch on, its whole picture flickers (2026-11-10: probably a uniform buffer the GPU writes where the write tracking does not see it)
 enum { UBM = 4096 };
 static struct { uint64_t addr, size, gen; vka_span s; int inplace; } g_ubm[UBM];
 static uint64_t g_ubm_gen = 1, g_ub_snaps, g_ub_snap_bytes, g_ub_snap_kept, g_ub_snap_memo; static int g_ub_snap;

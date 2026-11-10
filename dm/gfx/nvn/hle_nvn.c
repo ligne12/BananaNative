@@ -2286,7 +2286,8 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     if (f >= 8 && slow_on()) slow_emit(f - 8);
     prev_out = now_ns();
     // DM_VK_PRESENT_WAIT=1 (diagnostic, live): the present returns once the GPU has done every commit before it, so the game never writes a frame's data while the GPU
-    // runs the one before (CPU and GPU take turns: slower). To tell a race on data the game shares with the GPU from a fault of the replay. =n (n >= 2): once the GPU has
+    // runs the one before (CPU and GPU take turns: slower). To tell a race on data the game shares with the GPU from a fault of the replay; a fault it only makes rarer is no
+    // proof of a race (Ocarina of Time's foliage flicker, a shader translation fault reading stale workgroup memory, went from one frame in six to one in eighty). =n (n >= 2): once the GPU has
     // done this frame's (n - 1)th commit only (its first commits hold the frame's GPU culling): the CPU's next frame waits for them, the GPU keeps the rest of the frame
     {
         static uint64_t prev_last; static int logged; uint64_t last = mtl_last_fence();
