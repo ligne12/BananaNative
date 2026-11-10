@@ -720,6 +720,8 @@ OP_CONTROL_BARRIER, OP_GROUP_NON_UNIFORM_SHUFFLE = 224, 345
 SC_WORKGROUP, SCOPE_SUBGROUP, SEM_ACQ_REL_WORKGROUP = 4, 3, 0x8 | 0x100
 BUILTIN_SUBGROUP_SIZE, BUILTIN_SUBGROUP_ID, BUILTIN_SUBGROUP_LOCAL_INVOCATION_ID = 36, 40, 41
 CAP_GROUP_NON_UNIFORM, EXEC_MODE_LOCAL_SIZE = 61, 17
+OP_GROUP_NON_UNIFORM_BALLOT, OP_GROUP_NON_UNIFORM_BALLOT_BIT_EXTRACT, OP_GROUP_NON_UNIFORM_ANY, OP_LOGICAL_NOT = 339, 341, 335, 168
+CAP_GROUP_NON_UNIFORM_VOTE, CAP_GROUP_NON_UNIFORM_BALLOT = 62, 64
 VN_OPS = {OP_IADD, OP_ISUB, OP_IMUL, OP_SHR_LOGICAL, OP_SHR_ARITH, OP_SHL_LOGICAL, OP_BITWISE_OR, OP_BITWISE_XOR, OP_BITWISE_AND}
 
 
@@ -791,6 +793,12 @@ def shuffle_lds(m, shared_max):
     Qualcomm's driver shuffles natively and is faster with its base module (1.7 ms against 1.9). Two rows alternate, so a store comes after the other row's reads only
     with the barrier of the exchange between them; an exchange of the value a row still holds in the same block reads it without a store or barrier (LDSM's four reads of
     one address, MOVM's two); the last exchange before the block ends or another function is called gets a trailing barrier. The module is rewritten in place.
+    A lane that is not active stores nothing, so a read of its slot gave a value an earlier exchange left there, where NVIDIA's SHFL and the instruction give that lane's
+    register. The translator's code shuffles in branches whose condition differs between lanes (Ocarina of Time's foliage culling 5a2e37058f21c8a5: 32 of its 33
+    shuffles; a branch near the camera drawn for one frame in about seventy). The stores and barriers stay as they were (a subgroup barrier orders the active lanes,
+    as in a branch), and only the read is a selection: when an active lane asks for a lane that is not (the block's ballot of active lanes, one bit a lane, and a vote
+    over the subgroup, the same answer for every active lane), the exchange takes the instruction, else the row. The trailing barrier comes after the selection. A
+    shuffle in a loop header block (which the selection's split would break) keeps the instruction
     → bytes of workgroup memory added (0: not a compute module with such shuffles, or over shared_max with them; the module is then unchanged)"""
     if m.model != 'cs': return 0
     shuf = [x for x in m.ins if x[0] & 0xffff == OP_GROUP_NON_UNIFORM_SHUFFLE and m.op(x[1]) in (OP_TYPE_INT, OP_TYPE_FLOAT) and m.types[x[1]][2] == 32
@@ -808,8 +816,12 @@ def shuffle_lds(m, shared_max):
         k = next(k for k, x in enumerate(m.ins) if x[0] & 0xffff == OP_ENTRY_POINT); m.ins[k] = m.ins[k] + [xs]; m.ins[k][0] = len(m.ins[k]) << 16 | OP_ENTRY_POINT
     row_off = [None, m.add_const(u32, words)]; C = {v: m.add_const(u32, v) for v in (SCOPE_SUBGROUP, SEM_ACQ_REL_WORKGROUP)}
     sgid, sgsz, sgl = (input_builtin(m, b, u32) for b in (BUILTIN_SUBGROUP_ID, BUILTIN_SUBGROUP_SIZE, BUILTIN_SUBGROUP_LOCAL_INVOCATION_ID))
-    if CAP_GROUP_NON_UNIFORM not in m.caps:
-        at = max(k for k, x in enumerate(m.ins) if x[0] & 0xffff == OP_CAPABILITY); m.ins.insert(at + 1, [2 << 16 | OP_CAPABILITY, CAP_GROUP_NON_UNIFORM])
+    for cap in (CAP_GROUP_NON_UNIFORM, CAP_GROUP_NON_UNIFORM_VOTE, CAP_GROUP_NON_UNIFORM_BALLOT):
+        if cap not in m.caps:
+            at = max(k for k, x in enumerate(m.ins) if x[0] & 0xffff == OP_CAPABILITY); m.ins.insert(at + 1, [2 << 16 | OP_CAPABILITY, cap]); m.caps.append(cap)
+    t_bool = m.add_type(OP_TYPE_BOOL); v4 = m.add_type(OP_TYPE_VECTOR, u32, 4)
+    c_true = next((x[2] for x in m.ins if x[0] & 0xffff == OP_CONSTANT_TRUE and x[1] == t_bool), None)
+    if c_true is None: c_true = m.new_id(); m._insert_decl([3 << 16 | OP_CONSTANT_TRUE, t_bool, c_true])
     nm = lit_string('dm_shuffle_rows'); m.ins.insert(next(k for k, y in enumerate(m.ins) if y[0] & 0xffff in (OP_NAME, OP_DECORATE)), [(2 + len(nm)) << 16 | OP_NAME, xs, *nm])
     barrier = [4 << 16 | OP_CONTROL_BARRIER, C[SCOPE_SUBGROUP], C[SCOPE_SUBGROUP], C[SEM_ACQ_REL_WORKGROUP]]
     m.index()
@@ -825,9 +837,14 @@ def shuffle_lds(m, shared_max):
         more = {f for f, (_, c) in calls.items() if f not in exch and c & exch}
         if not more: break
         exch |= more
+    loop_hdr, lab = set(), None   # blocks that end with OpLoopMerge
+    for x in m.ins:
+        if x[0] & 0xffff == OP_LABEL: lab = x[1]
+        elif x[0] & 0xffff == OP_LOOP_MERGE: loop_hdr.add(lab)
     out, trail = [], []   # trail: positions in out after an exchange's read that take a barrier
     V = BlockValues(m)
     rows, dirty, last = [None, None], [False, False], None   # the value each row holds in this block, rows read since the last barrier, the last exchange's read
+    blk, act, tail = None, None, {}   # the block being copied, its ballot of active lanes, and the label its end has after a split (for the OpPhi of its successors)
     def close():   # the block ends or a function that exchanges runs: the last exchange gets a trailing barrier, and the rows' contents count as unknown after it
         nonlocal rows, dirty, last
         if last is not None: trail.append(last)
@@ -837,11 +854,13 @@ def shuffle_lds(m, shared_max):
     for x in m.ins:
         op = x[0] & 0xffff
         if op in (OP_LABEL, OP_FUNCTION_END) or (op == OP_FUNCTION_CALL and x[3] in exch): close()
+        if op == OP_LABEL: blk, act = x[1], None
         V.see(x)
-        if op != OP_GROUP_NON_UNIFORM_SHUFFLE or id(x) not in want: out.append(x); continue
+        if op != OP_GROUP_NON_UNIFORM_SHUFFLE or id(x) not in want or blk in loop_hdr: out.append(x); continue
         key = V(x[4])   # (a value number: the same in two shuffles of this block only when every lane's value is the same)
         row = next((r for r in (0, 1) if rows[r] == key), None)
         sg = em(OP_IMUL, u32, em(OP_LOAD, u32, sgid), em(OP_LOAD, u32, sgsz))
+        if act is None: act = em(OP_GROUP_NON_UNIFORM_BALLOT, v4, C[SCOPE_SUBGROUP], c_true)   # (the active lanes do not change inside a block)
         if row is None:   # store into a row nothing has read since the last barrier
             clean = [r for r in (0, 1) if not dirty[r]]
             if not clean: trail.append(last); clean = [0, 1]
@@ -853,10 +872,26 @@ def shuffle_lds(m, shared_max):
             rows[row] = key; dirty = [False, False]   # the barrier orders every earlier read
         else: base = sg if row == 0 else em(OP_IADD, u32, sg, row_off[1])
         dirty[row] = True
+        # an active lane asks for one that is not: the instruction, else the row
+        off = em(OP_LOGICAL_NOT, t_bool, em(OP_GROUP_NON_UNIFORM_BALLOT_BIT_EXTRACT, t_bool, C[SCOPE_SUBGROUP], act, x[5]))
+        need = em(OP_GROUP_NON_UNIFORM_ANY, t_bool, C[SCOPE_SUBGROUP], off)
+        l_rows, l_ins, l_end = m.new_id(), m.new_id(), m.new_id()
+        out.append([3 << 16 | OP_SELECTION_MERGE, l_end, 0]); out.append([4 << 16 | OP_BRANCH_CONDITIONAL, need, l_ins, l_rows])
+        out.append([2 << 16 | OP_LABEL, l_rows])
         r = em(OP_LOAD, u32, em(OP_ACCESS_CHAIN, p_u, xs, em(OP_IADD, u32, base, x[5])))
-        out.append([4 << 16 | (OP_COPY_OBJECT if x[1] == u32 else OP_BITCAST), x[1], x[2], r])
-        last = len(out)
+        r_rows = r if x[1] == u32 else em(OP_BITCAST, x[1], r)
+        out.append([2 << 16 | OP_BRANCH, l_end])
+        out.append([2 << 16 | OP_LABEL, l_ins])
+        r_ins = em(OP_GROUP_NON_UNIFORM_SHUFFLE, x[1], x[3], x[4], x[5])
+        out.append([2 << 16 | OP_BRANCH, l_end])
+        out.append([2 << 16 | OP_LABEL, l_end])
+        out.append([7 << 16 | OP_PHI, x[1], x[2], r_rows, l_rows, r_ins, l_ins])
+        last = len(out)   # (a trailing barrier goes here, after the selection)
+        tail[blk] = l_end
     for k in sorted(set(trail), reverse=True): out.insert(k, list(barrier))
+    for x in out:   # a successor's OpPhi names the block its value comes from: the end of a block that was split
+        if x[0] & 0xffff == OP_PHI:
+            for i in range(4, len(x), 2): x[i] = tail.get(x[i], x[i])
     m.ins = out; m.index()
     return 8 * words
 

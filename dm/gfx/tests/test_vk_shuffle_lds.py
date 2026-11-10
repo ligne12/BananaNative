@@ -97,7 +97,15 @@ class ShuffleLdsRewrite(unittest.TestCase):
             d = Path(d); m = compile_module(d)
             n = len(ops(m, spv.OP_GROUP_NON_UNIFORM_SHUFFLE)); before = spv.workgroup_bytes(m)
             self.assertEqual(spv.shuffle_lds(m, 32768), 8 * 128)   # two rows of a 128-invocation workgroup
-            self.assertEqual(ops(m, spv.OP_GROUP_NON_UNIFORM_SHUFFLE), [])
+            # every shuffle stays once, as the side of its exchange taken when an active lane asks for one that is not: the true target of a vote's branch
+            left = ops(m, spv.OP_GROUP_NON_UNIFORM_SHUFFLE); self.assertEqual(len(left), n)
+            self.assertEqual(len(ops(m, spv.OP_GROUP_NON_UNIFORM_ANY)), n)
+            label_of, lab = {}, None
+            for x in m.ins:
+                if x[0] & 0xffff == spv.OP_LABEL: lab = x[1]
+                label_of[id(x)] = lab
+            true_targets = {x[2] for x in ops(m, spv.OP_BRANCH_CONDITIONAL)}
+            self.assertTrue(all(label_of[id(x)] in true_targets for x in left))
             self.assertEqual(spv.workgroup_bytes(m), before + 8 * 128)
             xs = next(v for v, nm in m.names.items() if nm == 'dm_shuffle_rows')
             stores = [x for x in ops(m, spv.OP_STORE) if any(y[2] == x[1] and y[3] == xs for y in ops(m, spv.OP_ACCESS_CHAIN))]
@@ -134,6 +142,23 @@ class ShuffleLdsRewrite(unittest.TestCase):
             self.assertEqual(len(barriers), 2)   # the store's, and the trailing one at the block's end
             xs = next(v for v, nm in m.names.items() if nm == 'dm_shuffle_rows')
             self.assertEqual(sum(1 for x in ops(m, spv.OP_STORE) if any(y[2] == x[1] and y[3] == xs for y in ops(m, spv.OP_ACCESS_CHAIN))), 1)
+
+    def test_divergent_branch(self):   # a shuffle in a branch whose condition differs between lanes (5a2e37058f21c8a5's culling): an exchange per shuffle, valid
+        src = SHADER[:SHADER.index('shared uint other')] + '''void main()
+{
+    uint l = gl_SubgroupInvocationID & 31u, s = gl_SubgroupInvocationID & ~31u, a = src.w[gl_GlobalInvocationID.x], r = a;
+    if ((a & 3u) != 0u) { r = subgroupShuffle(a, s | ((l + 1u) & 31u)); if ((a & 4u) != 0u) r ^= subgroupShuffle(r, s | (l ^ 7u)); }
+    dst.w[gl_GlobalInvocationID.x] = r;
+}
+'''
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d); m = compile_module(d, src)
+            self.assertTrue(spv.shuffle_lds(m, 32768))
+            self.assertEqual(len(ops(m, spv.OP_GROUP_NON_UNIFORM_SHUFFLE)), 2)
+            self.assertEqual(len(ops(m, spv.OP_GROUP_NON_UNIFORM_BALLOT)), 2)   # one test per block that exchanges
+            (d / 'r.spv').write_bytes(m.data())
+            r = subprocess.run(['spirv-val', '--target-env', 'vulkan1.3', str(d / 'r.spv')], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
     def test_left_alone(self):
         with tempfile.TemporaryDirectory() as d:
